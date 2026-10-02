@@ -7,7 +7,7 @@ const assert = require("node:assert/strict");
 
 const root = path.resolve(__dirname, "..");
 const manifest = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
-assert.equal(manifest.main, "./src/extension.js");
+assert.equal(manifest.main, "./dist/main.js");
 assert.ok(manifest.enabledApiProposals.includes("chatSessionsProvider"));
 assert.ok(manifest.contributes.chatSessions.some((session) => session.type === "opencode"));
 assert.equal(manifest.contributes.chatSessions.find((session) => session.type === "opencode").requiresCustomModels, true,
@@ -18,9 +18,10 @@ assert.ok(manifest.enabledApiProposals.includes("chatProvider"), "[check] sessio
 assert.ok(manifest.contributes.languageModelChatProviders.some((provider) => provider.vendor === "opencode"));
 assert.equal(manifest.capabilities.untrustedWorkspaces.supported, false);
 JSON.parse(readFileSync(path.join(root, ".vscode/launch.json"), "utf8"));
+JSON.parse(readFileSync(path.join(root, ".vscode/tasks.json"), "utf8"));
 
 for (const file of [
-  "src/acp.js", "src/sessions.js", "src/extension.js",
+  "dist/main.js", "dist/extension.js", "dist/sessions.js", "dist/acp.js",
   "test/acp.test.js", "test/sessions.test.js", "test/extension.test.js",
   "test/fixtures/agent.cjs", "test/editor-smoke.cjs", "scripts/check.cjs",
 ]) {
@@ -29,4 +30,4 @@ for (const file of [
   if (result.status !== 0) process.exit(result.status ?? 1);
 }
 
-console.log("JavaScript syntax and basic manifest/launch validation passed");
+console.log("JavaScript syntax and basic manifest/launch/tasks validation passed");

@@ -10,11 +10,22 @@ No webview, separate chat, or changes to VS Code source. This is **not** a provi
 - An open, trusted local folder. For a multi-root workspace, the extension asks you to choose a working directory.
 - Native VS Code Chat must be enabled. The extension does not require a Copilot subscription, but it does not replace the editor's chat infrastructure.
 
-There are no new npm dependencies. `npm install`, compilation, and a separate extension server are not needed.
+Development requires Node.js and npm: `npm ci` installs the TypeScript/esbuild tools pinned in the lockfile.
+The `src/*.ts` source files are checked in strict mode and built into CommonJS bundles in `dist/`.
+The thin `src/main.ts` entry point loads the VS Code API; the editor runs `dist/main.js`, and unit tests run the other three bundles.
+There are no runtime npm dependencies or ACP SDK yet: the stdio transport remains custom. A separate extension server is not needed.
 
 ## Running without installing a VSIX
 
-From a terminal, launch a separate development window with the desired project:
+In a clean checkout, first install dependencies and build the extension from its root:
+
+```bash
+npm ci
+npm run build
+npm run check-types
+```
+
+Then, from a terminal, launch a separate development window with the desired project:
 
 ```bash
 code --new-window \
@@ -30,6 +41,7 @@ In the window that opens, run **OpenCode: New Native Chat Session** from the Com
 Sessions are registered as type `OpenCode`; their exact appearance in menus depends on the VS Code version.
 
 Alternatively, open the extension directory in VS Code and press F5 with the **OpenCode Native Chat** configuration.
+Both F5 configurations run the **build extension** task before launch and use sourcemaps from `dist/`; run `npm ci` beforehand.
 For actual work, open the desired folder in the Extension Development Host window.
 
 If the GUI cannot find the executable, specify an absolute path in user settings:
@@ -72,6 +84,7 @@ Restoring a saved session after **Developer: Reload Window** was also confirmed:
 The user confirmed explicit rejection through the permissions Quick Pick for `pwd` with a temporary project-level `ask` rule.
 These are manual confirmations, not automated UI tests. Explicit approval
 and recovery after a full editor restart have not yet been confirmed.
+These observations predate the TypeScript/build migration and do not automatically confirm native UI with the new bundles.
 The participant is registered with ID `opencode`, matching the session type, and routes native Send to the same ACP handler as the content provider.
 `opencode acp` launches a private server rather than connecting to a shared background service.
 
@@ -84,13 +97,28 @@ OpenCode permission settings still apply: a request appears only if OpenCode ask
 
 ```bash
 cd "$HOME/Documents/trash/opencode-vscode"
+npm ci
+npm run check-types
 npm test
 npm run check
 ```
 
-Tests use the Node.js built-in runner and a real child ACP fixture process, without an LLM, API keys, or npm packages.
+`npm test` first builds bundles through `pretest`; `npm run check` first builds and type-checks through `precheck`.
+Check verifies the syntax of bundles and remaining JS/CJS tests, the manifest, and launch/tasks JSON, but not editor compatibility.
+Tests use the Node.js built-in runner and a real child ACP fixture process, without an LLM, API keys, or a separate test framework.
 The VS Code boundary double in unit tests does not prove compatibility with the real editor.
 
+Before running a single file directly, update the bundles:
+
+```bash
+npm run build
+node --test test/extension.test.js
+```
+
+Known baseline: `editing a completed native request replaces its turn instead of appending another` fails
+with the original expectations (original pre-migration run: 41 pass / 1 fail). The migration does not fix replacement/resend or make the entire suite green.
+
+Before launching through the CLI, run `npm run build`; F5 builds the extension automatically.
 Run the real API smoke test with the **Native API smoke test** configuration or this command:
 
 ```bash
@@ -109,11 +137,16 @@ CLI extension tests use in-memory storage and do not inherit saved folder trust.
 If the editor asks for Workspace Trust, the test waits up to three minutes: run **Workspaces: Manage Workspace Trust**
 and trust only the current folder in the test window itself. The user makes the decision; the test does not set trust or disable protection.
 
+Final automated verification of the TypeScript/build migration after review fixes and separating independent scenarios: 59 pass / 1 fail, including 18 new boundary tests; the original replacement baseline is preserved. The full suite is not green.
+The smoke test and native UI were not run with the new bundles: manual Workspace Trust and user participation were unavailable in this run.
+No model was run, and Trust and credentials were not changed; the historical confirmations above do not replace verification of the new bundles.
+
 Manual verification: open a session, get a response, check approval and rejection, cancel a request, restart the window, and continue the saved session.
 Startup errors appear in Chat. Process stderr is available in the **OpenCode Native Chat** Output channel; check logs for secrets before sharing them.
 
 ## Contract sources
 
+- Vendored `types/vscode*.d.ts` files come from the public VS Code 1.140.0 tag; the full upstream MIT notice is preserved unchanged in [types/LICENSE.vscode.txt](types/LICENSE.vscode.txt), from [LICENSE.txt 1.140.0](https://raw.githubusercontent.com/microsoft/vscode/1.140.0/LICENSE.txt). This is attribution for Microsoft's declarations, not a license assignment for the project's own code.
 - [VS Code proposed API](https://code.visualstudio.com/api/advanced-topics/using-proposed-api)
 - [chatSessionsProvider 1.140.0](https://github.com/microsoft/vscode/blob/1.140.0/src/vscode-dts/vscode.proposed.chatSessionsProvider.d.ts)
 - [Native chatSessions registration](https://github.com/microsoft/vscode/blob/1.140.0/src/vs/workbench/contrib/chat/browser/chatSessions/chatSessions.contribution.ts)

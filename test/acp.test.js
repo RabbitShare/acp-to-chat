@@ -3,7 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("node:path");
-const { AcpClient } = require("../src/acp");
+const { AcpClient } = require("../dist/acp");
 
 function client(t, options = {}) {
   assert.equal(typeof AcpClient, "function", "ACP transport is not implemented");
@@ -34,6 +34,24 @@ test("rejects outstanding requests when the process exits", async (t) => {
 
 test("fails closed on malformed stdout", async (t) => {
   await assert.rejects(client(t).request("invalid", {}), /protocol|JSON/i);
+});
+
+test("boundary rejects a valid JSON request with an invalid ID before the callback", { timeout: 2000 }, async (t) => {
+  let calls = 0;
+  const connection = client(t, { onRequest: () => { calls++; } });
+  await assert.rejects(connection.request("invalid-request-id", {}, 500), /\[AcpClient.receive\] Invalid request id/);
+  assert.equal(calls, 0);
+});
+
+test("boundary sends a method-context wire error when a client callback throws non-Error", async (t) => {
+  const connection = client(t, { onRequest: (method) => {
+    assert.equal(method, "client/callback");
+    throw "callback failed";
+  } });
+  assert.deepEqual(await connection.request("client-callback", {}), {
+    jsonrpc: "2.0", id: "callback-1",
+    error: { code: -32601, message: "[AcpClient.answer] method=client/callback: callback failed" },
+  });
 });
 
 test("times out a stalled request", async (t) => {

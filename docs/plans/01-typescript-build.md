@@ -45,11 +45,11 @@ Keep `test/fixtures/agent.cjs` and `test/editor-smoke.cjs` in JavaScript: these 
 
 **Files:** `test/extension.test.js`, `test/sessions.test.js`, `test/acp.test.js`, `types/vscode*.d.ts`.
 
-- [ ] Before making changes, run `npm test` and `npm run check`; save the results as the baseline. If tests already fail, do not attribute the failures to the migration or fix them outside the agreed scope.
-- [ ] Preserve participant checks for a saved session, a foreign scheme, an already-cancelled request, and `opencode:/untitled-*` on the first Send.
-- [ ] Preserve model bridge checks: metadata without starting ACP, rejection of direct generation, zero token count.
-- [ ] Download the stable `vscode.d.ts` and declarations for the four proposals (`chatSessionsProvider`, `chatParticipantPrivate`, `chatParticipantAdditions`, `chatProvider`) from `https://raw.githubusercontent.com/microsoft/vscode/1.140.0/src/vscode-dts/`. Place them in `types/`; use the same tag for declaration dependencies.
-- [ ] Do not obtain proposed API declarations from `main`, a local installation, or an automatically downloaded latest version. Do not hide missing types with `any`, a global index signature, or by disabling strict mode.
+- [x] Before making changes, run `npm test` and `npm run check`; save the results as the baseline. If tests already fail, do not attribute the failures to the migration or fix them outside the agreed scope.
+- [x] Preserve participant checks for a saved session, a foreign scheme, an already-cancelled request, and `opencode:/untitled-*` on the first Send.
+- [x] Preserve model bridge checks: metadata without starting ACP, rejection of direct generation, zero token count.
+- [x] Download the stable `vscode.d.ts` and declarations for the four proposals (`chatSessionsProvider`, `chatParticipantPrivate`, `chatParticipantAdditions`, `chatProvider`) from `https://raw.githubusercontent.com/microsoft/vscode/1.140.0/src/vscode-dts/`. Place them in `types/`; use the same tag for declaration dependencies.
+- [x] Do not obtain proposed API declarations from `main`, a local installation, or an automatically downloaded latest version. Do not hide missing types with `any`, a global index signature, or by disabling strict mode.
 
 **Result:** a known baseline verification result and reproducible declarations for the target editor.
 
@@ -59,10 +59,10 @@ Keep `test/fixtures/agent.cjs` and `test/editor-smoke.cjs` in JavaScript: these 
 
 **Interfaces:** `register`, `renderUpdate`, `choosePermission`, `Sessions`, and `AcpClient` retain their external responsibilities. The entry point calls `activateWithApi(vscode, context)`; this adapter export replaces the previous `activate(context)` with its internal `require("vscode")`.
 
-- [ ] During execution, install only development tools: `npm install --save-dev --save-exact typescript esbuild @types/node`. Check that the selected versions are compatible with Node in the target extension host; do not also add `@types/vscode` if the vendored `vscode.d.ts` already declares the module.
-- [ ] Migrate the three runtime files to `.ts`, replace CommonJS with ES imports/exports, and add minimal types. Handle errors as `unknown` with narrowing; do not assume JSON data is automatically validated.
-- [ ] Keep local ACP types only for the subset in use. These are temporary types until plan 02, not a new implementation of ACP schemas.
-- [ ] Add the entry point:
+- [x] During execution, install only development tools: `npm install --save-dev --save-exact typescript esbuild @types/node`. Check that the selected versions are compatible with Node in the target extension host; do not also add `@types/vscode` if the vendored `vscode.d.ts` already declares the module.
+- [x] Migrate the three runtime files to `.ts`, replace CommonJS with ES imports/exports, and add minimal types. Handle errors as `unknown` with narrowing; do not assume JSON data is automatically validated.
+- [x] Keep local ACP types only for the subset in use. These are temporary types until plan 02, not a new implementation of ACP schemas.
+- [x] Add the entry point:
 
 ```ts
 import * as vscode from "vscode";
@@ -73,8 +73,8 @@ export function activate(context: vscode.ExtensionContext) {
 }
 ```
 
-- [ ] The native adapter receives the typed editor API as an argument. Do not import runtime `vscode` in the testable `extension.ts`, `sessions.ts`, and `acp.ts`; type-only imports are allowed. Do not rewrite the test double to cover the entire VS Code namespace: limit the boundary to members actually used.
-- [ ] Add `tsconfig.json`:
+- [x] The native adapter receives the typed editor API as an argument. Do not import runtime `vscode` in the testable `extension.ts`, `sessions.ts`, and `acp.ts`; type-only imports are allowed. Do not rewrite the test double to cover the entire VS Code namespace: limit the boundary to members actually used.
+- [x] Add `tsconfig.json`:
 
 ```json
 {
@@ -91,7 +91,7 @@ export function activate(context: vscode.ExtensionContext) {
 }
 ```
 
-- [ ] Add `scripts/build.mjs`. Four small bundles are needed so that tests continue checking individual modules while the extension host loads `main`:
+- [x] Add `scripts/build.mjs`. Four small bundles are needed so that tests continue checking individual modules while the extension host loads `main`:
 
 ```js
 import { build } from "esbuild";
@@ -110,9 +110,9 @@ await build({
 });
 ```
 
-- [ ] In `package.json`, set `main: "./dist/main.js"`; preserve the other contributions and activation events. Do not add `"type": "module"`: the existing `.js` tests remain CommonJS.
-- [ ] Add the commands `build: "node scripts/build.mjs"`, `check-types: "tsc --noEmit"`, `pretest: "npm run build"`, `precheck: "npm run build && npm run check-types"`. Keep `test` and `check` as separate commands. Do not add ESLint, tsx, Vitest, or a task runner.
-- [ ] In `.gitignore`, add `node_modules/` and `dist/`, preserving the editor profile exclusions. The lockfile must remain in Git.
+- [x] In `package.json`, set `main: "./dist/main.js"`; preserve the other contributions and activation events. Do not add `"type": "module"`: the existing `.js` tests remain CommonJS.
+- [x] Add the commands `build: "node scripts/build.mjs"`, `check-types: "tsc --noEmit"`, `pretest: "npm run build"`, `precheck: "npm run build && npm run check-types"`. Keep `test` and `check` as separate commands. Do not add ESLint, tsx, Vitest, or a task runner.
+- [x] In `.gitignore`, add `node_modules/` and `dist/`, preserving the editor profile exclusions. The lockfile must remain in Git.
 
 **Result:** strictly type-checked source files and CommonJS bundles without changes to ACP behavior.
 
@@ -120,9 +120,9 @@ await build({
 
 **Files:** `test/*.test.js`, `scripts/check.cjs`, `.vscode/launch.json`, `.vscode/tasks.json`, `README.md`, `AGENTS.md`.
 
-- [ ] Replace imports of `../src/acp`, `../src/sessions`, and `../src/extension` with `../dist/acp`, `../dist/sessions`, and `../dist/extension`. Do not move fixtures or the editor smoke test.
-- [ ] In `scripts/check.cjs`, check `manifest.main === "./dist/main.js"`; check the syntax of `dist/main.js`, `dist/extension.js`, `dist/sessions.js`, `dist/acp.js`, and the remaining JS/CJS tests. Preserve all checks for the current model bridge and Workspace Trust.
-- [ ] Add a build task for F5:
+- [x] Replace imports of `../src/acp`, `../src/sessions`, and `../src/extension` with `../dist/acp`, `../dist/sessions`, and `../dist/extension`. Do not move fixtures or the editor smoke test.
+- [x] In `scripts/check.cjs`, check `manifest.main === "./dist/main.js"`; check the syntax of `dist/main.js`, `dist/extension.js`, `dist/sessions.js`, `dist/acp.js`, and the remaining JS/CJS tests. Preserve all checks for the current model bridge and Workspace Trust.
+- [x] Add a build task for F5:
 
 ```json
 {
@@ -136,15 +136,15 @@ await build({
 }
 ```
 
-- [ ] In `.vscode/launch.json`, add `preLaunchTask: "build extension"` and `outFiles: ["${workspaceFolder}/dist/**/*.js"]` to both configurations; preserve the proposed API flag and smoke entry point.
-- [ ] Update README and AGENTS: dependency installation and a build are now required. To run an individual test directly, first run `npm run build`, then `node --test test/extension.test.js`. Use `npm ci` for a clean checkout once the lockfile exists.
-- [ ] Do not remove manual confirmations of the current native Chat or claim that they automatically remain valid after the migration.
+- [x] In `.vscode/launch.json`, add `preLaunchTask: "build extension"` and `outFiles: ["${workspaceFolder}/dist/**/*.js"]` to both configurations; preserve the proposed API flag and smoke entry point.
+- [x] Update README and AGENTS: dependency installation and a build are now required. To run an individual test directly, first run `npm run build`, then `node --test test/extension.test.js`. Use `npm ci` for a clean checkout once the lockfile exists.
+- [x] Do not remove manual confirmations of the current native Chat or claim that they automatically remain valid after the migration.
 
 **Result:** tests, CLI, and F5 use one consistent set of artifacts.
 
 ## Task 4. Final Verification
 
-- [ ] Run from the project root:
+- [x] Run from the project root:
 
 ```bash
 npm run build
@@ -155,12 +155,16 @@ git diff --check
 git status --short
 ```
 
-Expected: exit code 0, all current tests pass, and four bundles exist. There is no separate lint step; `check-types` and `check` do not pretend to be one.
+Initial final migration verification, before review fixes: build, check-types, check, diff-check, and status completed with exit code 0; four bundles exist. `npm test` completed with exit code 1: 41 pass / 1 fail — the original `editing a completed native request replaces its turn instead of appending another`, with no new failures or assertion changes. These are successful automated migration gates, but not a fully green suite. There is no separate lint step; `check-types` and `check` do not pretend to be one.
 
-- [ ] Review the diff: no runtime `require`/`module.exports` in `src/*.ts`, duplicate runtime in `.js`, unexpected dependencies, or security changes. The CommonJS exceptions are generated bundles and retained test fixtures.
+After review fixes and the separation of independent scenarios, 18 focused boundary tests were added for malformed permissions/updates, persisted metadata, JSON-RPC ID/result/capability, and a non-Error callback; repeated `npm test`: 59 pass / 1 fail with the same original replacement assertion. Build/type-check/check/diff-check succeed; runtime guards and the baseline were unchanged. The full upstream notice for the declarations is in `types/LICENSE.vscode.txt`.
+
+- [x] Review the diff: no runtime `require`/`module.exports` in `src/*.ts`, duplicate runtime in `.js`, unexpected dependencies, or security changes. The CommonJS exceptions are generated bundles and retained test fixtures.
 - [ ] Run the smoke test on the built extension in VS Code 1.140.0. This proves activation and the open command, not native Send.
 - [ ] Separately verify a native response, incremental streaming, a tool card, and Stop followed by the next request. Preserve Workspace Trust; do not work around `Language model unavailable` by reconfiguring OpenCode credentials.
 - [ ] Mark approval/rejection and recovery after restart as confirmed only with separate observations. If manual verification is unavailable, record the limitation; do not claim full UI compatibility.
+
+Smoke and native UI checks were not run on the new bundles: the isolated smoke test requires manual Workspace Trust, while UI scenarios require user participation and a real model. No manual interaction was requested in the current run, Trust and credentials were unchanged, and no model was run. Historical confirmations in README were preserved; full UI compatibility after the migration is not confirmed.
 
 ## Sources
 

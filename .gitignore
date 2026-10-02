@@ -1,3 +1,5 @@
 test/.editor-profile/
 test/.editor-extensions/
 *.vsix
+node_modules/
+dist/

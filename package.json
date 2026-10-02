@@ -6,7 +6,7 @@
   "publisher": "local",
   "private": true,
   "engines": { "vscode": "^1.140.0" },
-  "main": "./src/extension.js",
+  "main": "./dist/main.js",
   "extensionKind": ["workspace"],
   "enabledApiProposals": ["chatSessionsProvider", "chatParticipantPrivate", "chatParticipantAdditions", "chatProvider"],
   "activationEvents": ["onChatSession:opencode", "onChatParticipant:opencode", "onCommand:opencode.newSession"],
@@ -15,6 +15,10 @@
     "virtualWorkspaces": { "supported": false }
   },
   "scripts": {
+    "build": "node scripts/build.mjs",
+    "check-types": "tsc --noEmit",
+    "pretest": "npm run build",
+    "precheck": "npm run build && npm run check-types",
     "test": "node --test test/*.test.js",
     "check": "node scripts/check.cjs"
   },
@@ -46,5 +50,10 @@
         }
       }
     }
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3"
   }
 }

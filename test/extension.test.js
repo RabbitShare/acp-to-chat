@@ -3,8 +3,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("node:path");
-const { Sessions } = require("../src/sessions");
-const extension = require("../src/extension");
+const { Sessions } = require("../dist/sessions");
+const extension = require("../dist/extension");
 const { run: runEditorSmoke, waitForWorkspaceTrust } = require("./editor-smoke.cjs");
 
 function api() {
@@ -51,7 +51,7 @@ function api() {
   controller.items.add = (item) => controller.items.set(item.resource.toString(), item);
   controller.items.replace = (items) => { controller.items.clear(); items.forEach(controller.items.add); };
   const data = new Map();
-  const context = { subscriptions: [], workspaceState: { get: (key, fallback) => data.get(key) ?? fallback, update: async (key, value) => data.set(key, value) } };
+  const context = { subscriptions: [], workspaceState: { get: (key, fallback) => data.has(key) ? data.get(key) : fallback, update: async (key, value) => data.set(key, value) } };
   return { vscode, context, controller, data, participants, modelProviders };
 }
 
@@ -142,6 +142,67 @@ test("native request handler streams a real ACP turn and persists only metadata"
   assert.equal(data.get("sessions")[0].id, "session-1");
   assert.equal("history" in data.get("sessions")[0], false);
 });
+
+test("boundary excludes malformed seeded metadata without starting ACP", async (t) => {
+  const { vscode, context, controller, data } = api();
+  const backend = new Sessions({ command: process.execPath, args: [path.join(__dirname, "fixtures/agent.cjs")], cwd: __dirname, permission: async () => "no" });
+  t.after(() => backend.dispose());
+  const valid = [{ id: "saved-full", cwd: __dirname, label: "Saved", created: 1 }, { id: "saved-optional-absent", cwd: __dirname }];
+  const invalid = [
+    null, [], "not a record",
+    { id: "bad-label", cwd: __dirname, label: 1 },
+    { id: "bad-created", cwd: __dirname, created: "1" },
+    { id: "null-label", cwd: __dirname, label: null },
+    { id: "null-created", cwd: __dirname, created: null },
+  ];
+  data.set("sessions", [...valid, ...invalid]);
+  extension.register(vscode, context, backend);
+  await controller.refreshHandler();
+  assert.deepEqual([...controller.items.keys()], valid.map((record) => `opencode:/${record.id}`));
+  assert.equal(controller.items.get("opencode:/saved-full").label, "Saved");
+  assert.equal(controller.items.get("opencode:/saved-full").timing.created, 1);
+  assert.equal(controller.items.get("opencode:/saved-optional-absent").label, "OpenCode session");
+  for (const record of invalid.filter((value) => value && typeof value.id === "string")) {
+    await assert.rejects(vscode.provider.provideChatSessionContent(vscode.Uri.from({ scheme: "opencode", path: `/${record.id}` }), token), /Saved session not found/);
+    assert.equal(backend.records.has(record.id), false);
+  }
+  assert.equal(backend.client, undefined, "Rejected metadata must not start ACP");
+});
+
+test("boundary restores valid seeded metadata and loads replayed history", async (t) => {
+  const { vscode, context, controller, data } = api();
+  const backend = new Sessions({ command: process.execPath, args: [path.join(__dirname, "fixtures/agent.cjs")], cwd: __dirname, permission: async () => "no" });
+  t.after(() => backend.dispose());
+  const valid = [{ id: "saved-full", cwd: __dirname, label: "Saved", created: 1 }, { id: "saved-optional-absent", cwd: __dirname }];
+  data.set("sessions", valid);
+  extension.register(vscode, context, backend);
+  await controller.refreshHandler();
+  assert.deepEqual([...controller.items.keys()], valid.map((record) => `opencode:/${record.id}`));
+  assert.equal(controller.items.get("opencode:/saved-full").label, "Saved");
+  assert.equal(controller.items.get("opencode:/saved-full").timing.created, 1);
+  assert.equal(controller.items.get("opencode:/saved-optional-absent").label, "OpenCode session");
+  for (const record of valid) {
+    const session = await vscode.provider.provideChatSessionContent(vscode.Uri.from({ scheme: "opencode", path: `/${record.id}` }), token);
+    assert.equal(session.history[0].prompt, "previous question");
+    assert.equal(session.history[1].response[0].value.value, "previous answer");
+    assert.equal(backend.records.get(record.id).cwd, __dirname);
+  }
+});
+
+for (const stored of [null, { id: "not-an-array", cwd: __dirname }, "not an array"]) {
+  test(`boundary ignores non-array persisted metadata: ${JSON.stringify(stored)}`, async (t) => {
+    const { vscode, context, controller, data } = api();
+    const backend = new Sessions({ command: process.execPath, args: [path.join(__dirname, "fixtures/agent.cjs")], cwd: __dirname, permission: async () => "no" });
+    t.after(() => backend.dispose());
+    data.set("sessions", stored);
+    extension.register(vscode, context, backend);
+    await controller.refreshHandler();
+    assert.equal(controller.items.size, 0);
+    await assert.rejects(vscode.provider.provideChatSessionContent(vscode.Uri.from({ scheme: "opencode", path: "/not-an-array" }), token), /Saved session not found/);
+    assert.equal(backend.records.size, 0);
+    assert.equal(backend.client, undefined);
+  });
+}
 
 test("session-type participant routes a materialized native request to ACP", async (t) => {
   const { vscode, context, controller, participants } = api();
@@ -307,6 +368,15 @@ test("agent Markdown cannot enable command links or HTML", () => {
   assert.equal(part.value.value, text);
   assert.equal(part.value.isTrusted, false);
   assert.equal(part.value.supportHtml, false);
+});
+
+test("boundary does not render non-string text but renders a valid positive control", () => {
+  const { vscode } = api();
+  for (const sessionUpdate of ["agent_message_chunk", "agent_thought_chunk"]) {
+    assert.equal(extension.renderUpdate(vscode, { sessionUpdate, content: { type: "text", text: 1 } }, new Map()), undefined);
+    const part = extension.renderUpdate(vscode, { sessionUpdate, content: { type: "text", text: "valid control" } }, new Map());
+    assert.equal(sessionUpdate === "agent_message_chunk" ? part.value.value : part.value, "valid control");
+  }
 });
 
 test("native handler rejects backend errors instead of returning an ignored result", async (t) => {

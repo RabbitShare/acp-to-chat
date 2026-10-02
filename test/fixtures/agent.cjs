@@ -19,6 +19,7 @@ const permissions = new Map();
 const workingDirectories = new Map();
 let sessionCount = 0;
 let firstEcho;
+let callbackRequestId;
 const scenario = process.argv[2];
 if (scenario === "stubborn") {
   process.on("SIGTERM", () => {});
@@ -29,6 +30,14 @@ lines.on("line", (line) => {
   const message = JSON.parse(line);
 
   if (message.method === "initialize") {
+    if (scenario === "initialize-null" || scenario === "initialize-invalid") {
+      send({ id: message.id, result: scenario === "initialize-null" ? null : { protocolVersion: "1" } });
+      return;
+    }
+    if (scenario === "invalid-load-capability") {
+      send({ id: message.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: "true" } } });
+      return;
+    }
     send({ id: message.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
   } else if (message.method === "echo") {
     const reply = { id: message.id, result: { text: "Hello 🌍", params: message.params } };
@@ -43,9 +52,20 @@ lines.on("line", (line) => {
     process.exit(3);
   } else if (message.method === "invalid") {
     process.stdout.write("not json\n");
+  } else if (message.method === "invalid-request-id") {
+    send({ id: {}, method: "client/callback", params: {} });
+  } else if (message.method === "client-callback") {
+    callbackRequestId = message.id;
+    send({ id: "callback-1", method: "client/callback", params: {} });
+  } else if (message.id === "callback-1") {
+    send({ id: callbackRequestId, result: message });
   } else if (message.method === "session/new") {
     if (typeof message.params.cwd !== "string" || !require("node:path").isAbsolute(message.params.cwd)) {
       send({ id: message.id, error: { code: -32602, message: "cwd must be absolute" } });
+      return;
+    }
+    if (scenario === "new-null" || scenario === "new-invalid") {
+      send({ id: message.id, result: scenario === "new-null" ? null : { sessionId: 1 } });
       return;
     }
     const sessionId = `session-${++sessionCount}`;
@@ -66,7 +86,10 @@ lines.on("line", (line) => {
     pending.set(sessionId, { id: message.id, cancelled: false });
     permissions.set(permissionId, sessionId);
     send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `answer:${message.params.prompt[0].text}` } } } });
-    send({ id: permissionId, method: "session/request_permission", params: { sessionId, toolCall: { toolCallId: `tool-${sessionId}`, title: "Run command", rawInput: { command: "pwd" } }, options: [{ optionId: "yes", name: "Allow once", kind: "allow_once" }, { optionId: "no", name: "Reject", kind: "reject_once" }] } });
+    const permission = { sessionId, toolCall: { toolCallId: `tool-${sessionId}`, title: "Run command", rawInput: { command: "pwd" } }, options: [{ optionId: "yes", name: "Allow once", kind: "allow_once" }, { optionId: "no", name: "Reject", kind: "reject_once" }] };
+    if (scenario === "malformed-permission-tool") permission.toolCall.toolCallId = 1;
+    if (scenario === "malformed-permission-option") permission.options[0].name = null;
+    send({ id: permissionId, method: "session/request_permission", params: permission });
     if (scenario === "crash-prompt") setTimeout(() => process.exit(8), 100);
   } else if (message.method === "session/cancel") {
     const turn = pending.get(message.params.sessionId);

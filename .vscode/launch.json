@@ -6,6 +6,8 @@
       "type": "extensionHost",
       "request": "launch",
       "runtimeExecutable": "${execPath}",
+      "preLaunchTask": "build extension",
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}",
         "--enable-proposed-api=local.opencode-native-chat",
@@ -17,6 +19,8 @@
       "type": "extensionHost",
       "request": "launch",
       "runtimeExecutable": "${execPath}",
+      "preLaunchTask": "build extension",
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}",
         "--extensionTestsPath=${workspaceFolder}/test/editor-smoke.cjs",

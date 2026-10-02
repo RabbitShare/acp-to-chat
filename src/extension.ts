@@ -1,53 +1,72 @@
-"use strict";
+import { isAbsolute } from "node:path";
+import { Sessions, type SavedSession, type SessionRecord, type SessionStatus } from "./sessions";
+import type * as VSCode from "vscode";
+import { errorMessage, isObject, isTextContent, type PermissionParams, type SessionUpdate } from "./protocol";
 
-const { isAbsolute } = require("node:path");
-const { Sessions } = require("./sessions");
+export type EditorApi = Pick<typeof VSCode,
+  "MarkdownString" | "ChatResponseMarkdownPart" | "ChatResponseThinkingProgressPart" |
+  "ChatToolInvocationPart" | "ChatRequestTurn2" | "ChatResponseTurn2" | "ChatSessionStatus" | "Uri"> & {
+  window: Pick<typeof VSCode.window, "createQuickPick" | "showWorkspaceFolderPick" | "showErrorMessage" | "createOutputChannel">;
+  workspace: Pick<typeof VSCode.workspace, "isTrusted" | "workspaceFolders" | "getConfiguration">;
+  chat: Pick<typeof VSCode.chat, "createChatParticipant" | "createChatSessionItemController" | "registerChatSessionContentProvider">;
+  lm: Pick<typeof VSCode.lm, "registerLanguageModelChatProvider">;
+  commands: Pick<typeof VSCode.commands, "registerCommand" | "executeCommand">;
+};
+
+export interface AdapterContext {
+  subscriptions: { dispose(): unknown }[];
+  workspaceState: Pick<VSCode.Memento, "get" | "update">;
+}
+
+type ToolState = SessionUpdate & { toolCallId: string };
+type RenderedPart = VSCode.ChatResponseMarkdownPart | VSCode.ChatResponseThinkingProgressPart | VSCode.ChatToolInvocationPart;
+type NativeSession = Omit<VSCode.ChatSession, "requestHandler"> & { requestHandler: VSCode.ChatRequestHandler };
 
 const SESSION_TYPE = "opencode";
 const PARTICIPANT = SESSION_TYPE;
 
-function markdown(vscode, text) {
+function markdown(vscode: Pick<EditorApi, "MarkdownString">, text: string) {
   const value = new vscode.MarkdownString(text);
   value.isTrusted = false;
   value.supportHtml = false;
   return value;
 }
 
-function display(value) {
+function display(value: unknown): string {
   if (value === undefined || value === null) return "";
-  return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  return typeof value === "string" ? value : JSON.stringify(value, null, 2) ?? "";
 }
 
-function renderUpdate(vscode, update, tools) {
-  if (update.sessionUpdate === "agent_message_chunk" && update.content?.type === "text") {
+export function renderUpdate(vscode: Pick<EditorApi, "MarkdownString" | "ChatResponseMarkdownPart" | "ChatResponseThinkingProgressPart" | "ChatToolInvocationPart">, update: SessionUpdate, tools: Map<string, ToolState>): RenderedPart | undefined {
+  if (update.sessionUpdate === "agent_message_chunk" && isTextContent(update.content)) {
     return new vscode.ChatResponseMarkdownPart(markdown(vscode, update.content.text));
   }
 
-  if (update.sessionUpdate === "agent_thought_chunk" && update.content?.type === "text") {
+  if (update.sessionUpdate === "agent_thought_chunk" && isTextContent(update.content)) {
     return new vscode.ChatResponseThinkingProgressPart(update.content.text);
   }
 
-  if (["tool_call", "tool_call_update"].includes(update.sessionUpdate)) {
+  if (["tool_call", "tool_call_update"].includes(update.sessionUpdate) && typeof update.toolCallId === "string") {
     const previous = tools.get(update.toolCallId);
-    const tool = { ...previous, ...Object.fromEntries(Object.entries(update).filter(([, value]) => value !== null && value !== undefined)) };
+    const tool: ToolState = { ...previous, ...Object.fromEntries(Object.entries(update).filter(([, value]) => value !== null && value !== undefined)), sessionUpdate: update.sessionUpdate, toolCallId: update.toolCallId };
     tools.set(update.toolCallId, tool);
     const part = new vscode.ChatToolInvocationPart(tool.name ?? tool.kind ?? "OpenCode tool", tool.toolCallId);
     part.invocationMessage = tool.title ?? tool.toolCallId;
     part.pastTenseMessage = tool.title ?? tool.toolCallId;
-    part.isComplete = ["completed", "failed"].includes(tool.status);
+    part.isComplete = ["completed", "failed"].includes(tool.status ?? "");
     part.isError = tool.status === "failed";
-    part.isConfirmed = ["in_progress", "completed", "failed"].includes(tool.status);
+    part.isConfirmed = ["in_progress", "completed", "failed"].includes(tool.status ?? "");
     part.enablePartialUpdate = Boolean(previous);
     part.toolSpecificData = { input: display(tool.rawInput), output: display(tool.rawOutput ?? tool.content) };
     return part;
   }
 }
 
-function choosePermission(vscode, params, signal) {
+export function choosePermission(vscode: { window: Pick<EditorApi["window"], "createQuickPick"> }, params: PermissionParams, signal: AbortSignal): Promise<string | undefined> {
   if (signal.aborted) return Promise.resolve(undefined);
 
-  return new Promise((resolve) => {
-    const picker = vscode.window.createQuickPick();
+  return new Promise<string | undefined>((resolve) => {
+    const picker = vscode.window.createQuickPick<VSCode.QuickPickItem & { optionId: string }>();
     const input = display(params.toolCall.rawInput);
     picker.title = `OpenCode: ${params.toolCall.title ?? params.toolCall.toolCallId}`;
     picker.placeholder = `session=${params.sessionId} tool=${params.toolCall.toolCallId}`;
@@ -58,7 +77,7 @@ function choosePermission(vscode, params, signal) {
       optionId: option.optionId,
     }));
     let done = false;
-    const finish = (optionId) => {
+    const finish = (optionId: string | undefined) => {
       if (done) return;
       done = true;
       signal.removeEventListener("abort", cancel);
@@ -77,7 +96,7 @@ function choosePermission(vscode, params, signal) {
   });
 }
 
-function register(vscode, context, backend) {
+export function register(vscode: EditorApi, context: AdapterContext, backend: Sessions) {
   if (!vscode.workspace.isTrusted) throw new Error("[register] OpenCode requires a trusted workspace");
   const folders = (vscode.workspace.workspaceFolders ?? []).filter((folder) => folder.uri.scheme === "file");
   if (!folders.length) throw new Error("[register] Open a local workspace folder before using OpenCode");
@@ -105,17 +124,19 @@ function register(vscode, context, backend) {
     provideTokenCount: async () => 0,
   }));
 
-  const saved = new Map((context.workspaceState.get("sessions", []) ?? [])
-    .filter((record) => typeof record.id === "string" && typeof record.cwd === "string" && isAbsolute(record.cwd) && folders.some((folder) => folder.uri.fsPath === record.cwd))
+  const stored = context.workspaceState.get<unknown>("sessions", []);
+  const saved = new Map<string, SavedSession>((Array.isArray(stored) ? stored : [])
+    .filter((record: unknown): record is SavedSession => isObject(record) && typeof record.id === "string" && typeof record.cwd === "string" && isAbsolute(record.cwd) && folders.some((folder) => folder.uri.fsPath === record.cwd) &&
+      (record.label === undefined || typeof record.label === "string") && (record.created === undefined || typeof record.created === "number"))
     .map((record) => [record.id, record]));
-  const aliases = new Map();
+  const aliases = new Map<string, Promise<SessionRecord>>();
   let write = Promise.resolve();
   const persist = () => {
     const snapshot = [...saved.values()];
     write = write.catch(() => {}).then(() => context.workspaceState.update("sessions", snapshot));
     return write;
   };
-  const resourceFor = (id) => vscode.Uri.from({ scheme: SESSION_TYPE, path: `/${id}` });
+  const resourceFor = (id: string) => vscode.Uri.from({ scheme: SESSION_TYPE, path: `/${id}` });
   const participant = vscode.chat.createChatParticipant(PARTICIPANT, async (request, chatContext, stream, token) => {
     const resource = chatContext.chatSessionContext?.chatSessionItem.resource;
     if (resource?.scheme !== SESSION_TYPE) {
@@ -129,31 +150,32 @@ function register(vscode, context, backend) {
   });
   context.subscriptions.push(participant, backend);
 
-  let controller;
+  let controller: VSCode.ChatSessionItemController;
   try {
     controller = vscode.chat.createChatSessionItemController(SESSION_TYPE, async () => {
       controller.items.replace([...saved.values()].map(itemFor));
     });
   } catch (error) {
-    throw new Error(`[register] Cannot enable chatSessionsProvider. Launch with --enable-proposed-api=local.opencode-native-chat: ${error.message}`);
+    throw new Error(`[register] Cannot enable chatSessionsProvider. Launch with --enable-proposed-api=local.opencode-native-chat: ${errorMessage(error)}`);
   }
   context.subscriptions.push(controller);
 
-  function itemFor(record, status = "completed") {
+  function itemFor(record: SavedSession, status: SessionStatus | number = "completed") {
     const item = controller.createChatSessionItem(resourceFor(record.id), record.label ?? "OpenCode session");
     const statuses = { inProgress: vscode.ChatSessionStatus.InProgress, completed: vscode.ChatSessionStatus.Completed, needsInput: vscode.ChatSessionStatus.NeedsInput, failed: vscode.ChatSessionStatus.Failed };
-    item.status = statuses[status];
+    // Array.map also passes its numeric index here; preserve the existing refresh behavior.
+    item.status = typeof status === "string" ? statuses[status] : undefined;
     item.description = record.cwd;
     item.timing = { created: record.created ?? Date.now() };
     return item;
   }
 
-  async function remember(record) {
+  async function remember(record: SavedSession) {
     saved.set(record.id, { id: record.id, cwd: record.cwd, label: record.label, created: record.created });
     await persist();
   }
 
-  async function create(prompt, token) {
+  async function create(prompt: string, token: VSCode.CancellationToken) {
     if (token.isCancellationRequested) throw new Error("[create] Session creation cancelled");
     const folder = folders.length === 1 ? folders[0] : await vscode.window.showWorkspaceFolderPick({ placeHolder: "Choose the OpenCode working directory" });
     if (!folder || token.isCancellationRequested) throw new Error("[create] Working directory selection cancelled");
@@ -167,18 +189,22 @@ function register(vscode, context, backend) {
 
   controller.newChatSessionItemHandler = (request, token) => create(request.request.prompt, token);
 
-  async function recordFor(resource, prompt, token) {
+  async function recordFor(resource: VSCode.Uri, prompt: string, token: VSCode.CancellationToken): Promise<SessionRecord> {
     if (resource.scheme !== SESSION_TYPE) throw new Error(`[recordFor] Invalid scheme=${resource.scheme}`);
     const id = resource.path.slice(1);
 
     if (id.startsWith("untitled-")) {
       const key = resource.toString();
-      if (!aliases.has(key)) {
-        const pending = create(prompt, token).then((item) => backend.records.get(item.resource.path.slice(1)));
-        aliases.set(key, pending);
-        pending.catch(() => aliases.delete(key));
-      }
-      return aliases.get(key);
+      const existing = aliases.get(key);
+      if (existing) return existing;
+      const pending = create(prompt, token).then((item) => {
+        const record = backend.records.get(item.resource.path.slice(1));
+        if (!record) throw new Error(`[recordFor] Created session not found resource=${item.resource.toString()}`);
+        return record;
+      });
+      aliases.set(key, pending);
+      pending.catch(() => aliases.delete(key));
+      return pending;
     }
 
     const record = saved.get(id);
@@ -186,26 +212,26 @@ function register(vscode, context, backend) {
     return backend.load(record);
   }
 
-  function historyFor(record) {
+  function historyFor(record: SessionRecord) {
     return record.history.map((turn) => {
       if (turn.role === "user") return new vscode.ChatRequestTurn2(turn.text, undefined, [], PARTICIPANT, [], undefined, undefined, undefined, undefined);
-      const tools = new Map();
-      const parts = turn.updates.map((update) => renderUpdate(vscode, update, tools)).filter(Boolean);
+      const tools = new Map<string, ToolState>();
+      const parts = turn.updates.map((update) => renderUpdate(vscode, update, tools)).filter((part): part is RenderedPart => part !== undefined);
       return new vscode.ChatResponseTurn2(parts, {}, PARTICIPANT);
     });
   }
 
-  const statusListener = (record, status) => {
+  const statusListener = (record: SessionRecord, status: SessionStatus) => {
     controller.items.add(itemFor(record, status));
-    remember(record).catch((error) => vscode.window.showErrorMessage(`[remember] sessionId=${record.id}: ${error.message}`));
+    remember(record).catch((error: unknown) => vscode.window.showErrorMessage(`[remember] sessionId=${record.id}: ${errorMessage(error)}`));
   };
   backend.on("status", statusListener);
   context.subscriptions.push({ dispose: () => backend.off("status", statusListener) });
-  const failureListener = (error) => vscode.window.showErrorMessage(`[OpenCode connection] ${error.message}`);
+  const failureListener = (error: Error) => vscode.window.showErrorMessage(`[OpenCode connection] ${error.message}`);
   backend.on("failure", failureListener);
   context.subscriptions.push({ dispose: () => backend.off("failure", failureListener) });
 
-  const provider = {
+  const provider: { provideChatSessionContent(resource: VSCode.Uri, token: VSCode.CancellationToken): Promise<NativeSession> } = {
     async provideChatSessionContent(resource, token) {
       const record = resource.path.startsWith("/untitled-") ? undefined : await recordFor(resource, "", token);
 
@@ -221,7 +247,7 @@ function register(vscode, context, backend) {
             if (abort.signal.aborted) return {};
             const currentResource = chatContext.chatSessionContext?.chatSessionItem.resource ?? resource;
             const current = await recordFor(currentResource, request.prompt, requestToken);
-            const tools = new Map();
+            const tools = new Map<string, ToolState>();
             await backend.prompt(current, request.prompt, abort.signal, (update) => {
               const part = renderUpdate(vscode, update, tools);
               if (part instanceof vscode.ChatResponseMarkdownPart) stream.markdown(part.value);
@@ -231,7 +257,7 @@ function register(vscode, context, backend) {
           } catch (error) {
             if (abort.signal.aborted) return {};
             // VS Code 1.140.0 ignores a session handler's returned ChatResult, but renders thrown errors.
-            throw new Error(`[requestHandler] resource=${resource.toString()}: ${error.message}`, { cause: error });
+            throw new Error(`[requestHandler] resource=${resource.toString()}: ${errorMessage(error)}`, { cause: error });
           } finally {
             cancellation.dispose();
             abort.abort();
@@ -247,8 +273,7 @@ function register(vscode, context, backend) {
   return controller;
 }
 
-function activate(context) {
-  const vscode = require("vscode");
+export function activateWithApi(vscode: EditorApi, context: AdapterContext) {
   const output = vscode.window.createOutputChannel("OpenCode Native Chat");
   context.subscriptions.push(output);
   const backend = new Sessions({
@@ -262,9 +287,7 @@ function activate(context) {
     return register(vscode, context, backend);
   } catch (error) {
     backend.dispose();
-    vscode.window.showErrorMessage(`[activate] ${error.message}`);
+    vscode.window.showErrorMessage(`[activate] ${errorMessage(error)}`);
     throw error;
   }
 }
-
-module.exports = { activate, register, renderUpdate, choosePermission };

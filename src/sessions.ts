@@ -1,13 +1,45 @@
-"use strict";
+import { EventEmitter } from "node:events";
+import { AcpClient } from "./acp";
+import { errorMessage, isObject, isPermissionParams, isSessionUpdate, isTextContent, type PermissionParams, type SessionUpdate } from "./protocol";
 
-const { EventEmitter } = require("node:events");
-const { AcpClient } = require("./acp");
+export interface SavedSession {
+  id: string;
+  cwd: string;
+  label?: string;
+  created?: number;
+}
 
-class Sessions extends EventEmitter {
-  constructor({ command, args = ["acp"], cwd, permission, onLog = () => {} }) {
+type HistoryTurn =
+  | { role: "user"; text: string; messageId?: string | null }
+  | { role: "assistant"; updates: SessionUpdate[]; messageId?: string | null };
+
+export interface SessionRecord extends SavedSession {
+  history: HistoryTurn[];
+  connection?: AcpClient;
+  loading?: Promise<void>;
+  turn?: { controller: AbortController; onUpdate: (update: SessionUpdate) => void };
+}
+
+export type SessionStatus = "inProgress" | "completed" | "needsInput" | "failed";
+
+interface SessionOptions {
+  command: string;
+  args?: string[];
+  cwd?: string;
+  permission: (params: PermissionParams, signal: AbortSignal) => string | undefined | Promise<string | undefined>;
+  onLog?: (text: string) => void;
+}
+
+export class Sessions extends EventEmitter<{ status: [record: SessionRecord, status: SessionStatus]; failure: [error: Error] }> {
+  options: SessionOptions & { args: string[]; onLog: (text: string) => void };
+  records: Map<string, SessionRecord>;
+  ready?: Promise<AcpClient>;
+  client?: AcpClient;
+
+  constructor({ command, args = ["acp"], cwd, permission, onLog = () => {} }: SessionOptions) {
     super();
     this.options = { command, args, cwd, permission, onLog };
-    this.records = new Map();
+    this.records = new Map<string, SessionRecord>();
   }
 
   async connect() {
@@ -18,10 +50,10 @@ class Sessions extends EventEmitter {
         onRequest: (method, params) => this.requestPermission(method, params),
       });
       this.client = connection;
-      connection.on("notification", (method, params) => {
+      connection.on("notification", (method: string, params: unknown) => {
         if (method === "session/update") this.update(params);
       });
-      connection.on("failure", (error) => {
+      connection.on("failure", (error: Error) => {
         for (const record of this.records.values()) record.turn?.controller.abort();
         if (this.client === connection) {
           this.client = undefined;
@@ -39,12 +71,15 @@ class Sessions extends EventEmitter {
         clientInfo: { name: "opencode-native-chat", version: "0.0.1" },
         clientCapabilities: {},
       }).then((result) => {
-        if (result.protocolVersion !== 1) {
-          throw new Error(`[Sessions.connect] Unsupported ACP protocolVersion=${result.protocolVersion}`);
+        if (!isObject(result) || result.protocolVersion !== 1) {
+          throw new Error(`[Sessions.connect] Unsupported ACP protocolVersion=${isObject(result) ? result.protocolVersion : undefined}`);
         }
-        connection.capabilities = result.agentCapabilities ?? {};
+        const capabilities = result.agentCapabilities;
+        if (isObject(capabilities) && (capabilities.loadSession === undefined || typeof capabilities.loadSession === "boolean")) {
+          connection.capabilities = capabilities;
+        }
         return connection;
-      }).catch((error) => {
+      }).catch((error: unknown) => {
         connection.dispose();
         throw error;
       });
@@ -53,21 +88,21 @@ class Sessions extends EventEmitter {
     return this.ready;
   }
 
-  async create(cwd) {
+  async create(cwd: string) {
     const connection = await this.connect();
     const result = await connection.request("session/new", { cwd, mcpServers: [] });
 
-    if (typeof result.sessionId !== "string" || !result.sessionId) {
+    if (!isObject(result) || typeof result.sessionId !== "string" || !result.sessionId) {
       throw new Error(`[Sessions.create] Missing sessionId cwd=${cwd}`);
     }
 
-    const record = { id: result.sessionId, cwd, label: "New OpenCode session", created: Date.now(), history: [], connection };
+    const record: SessionRecord = { id: result.sessionId, cwd, label: "New OpenCode session", created: Date.now(), history: [], connection };
     this.records.set(record.id, record);
     return record;
   }
 
-  async load(saved) {
-    const record = this.records.get(saved.id) ?? { ...saved, history: [] };
+  async load(saved: SavedSession) {
+    const record: SessionRecord = this.records.get(saved.id) ?? { ...saved, history: [] };
     this.records.set(record.id, record);
     const connection = await this.connect();
 
@@ -87,11 +122,13 @@ class Sessions extends EventEmitter {
     return record;
   }
 
-  update({ sessionId, update }) {
+  update(params: unknown) {
+    if (!isObject(params) || typeof params.sessionId !== "string" || !isSessionUpdate(params.update)) return;
+    const { sessionId, update } = params;
     const record = this.records.get(sessionId);
-    if (!record || !update || typeof update.sessionUpdate !== "string") return;
+    if (!record) return;
 
-    if (update.sessionUpdate === "user_message_chunk" && update.content?.type === "text") {
+    if (update.sessionUpdate === "user_message_chunk" && isTextContent(update.content)) {
       const last = record.history.at(-1);
       if (last?.role === "user" && last.messageId === update.messageId) {
         last.text += update.content.text;
@@ -110,15 +147,16 @@ class Sessions extends EventEmitter {
     if (record.turn && !record.turn.controller.signal.aborted) record.turn.onUpdate(update);
   }
 
-  async requestPermission(method, params) {
+  async requestPermission(method: string, params: unknown) {
     if (method !== "session/request_permission") {
       throw new Error(`[Sessions.requestPermission] Unsupported method=${method}`);
     }
 
+    const cancelled = { outcome: { outcome: "cancelled" } };
+    if (!isPermissionParams(params)) return cancelled;
     const record = this.records.get(params.sessionId);
     const turn = record?.turn;
-    const cancelled = { outcome: { outcome: "cancelled" } };
-    if (!turn || turn.controller.signal.aborted || !Array.isArray(params.options)) return cancelled;
+    if (!record || !turn || turn.controller.signal.aborted) return cancelled;
 
     this.emit("status", record, "needsInput");
 
@@ -129,14 +167,14 @@ class Sessions extends EventEmitter {
       }
       return { outcome: { outcome: "selected", optionId } };
     } catch (error) {
-      this.options.onLog(`[Sessions.requestPermission] sessionId=${record.id}: ${error.message}\n`);
+      this.options.onLog(`[Sessions.requestPermission] sessionId=${record.id}: ${errorMessage(error)}\n`);
       return cancelled;
     } finally {
       if (record.turn === turn) this.emit("status", record, "inProgress");
     }
   }
 
-  async prompt(record, text, signal, onUpdate) {
+  async prompt(record: SessionRecord, text: string, signal: AbortSignal, onUpdate: (update: SessionUpdate) => void) {
     if (record.turn) throw new Error(`[Sessions.prompt] Prompt already active sessionId=${record.id}`);
     if (signal.aborted) return { stopReason: "cancelled" };
 
@@ -145,14 +183,15 @@ class Sessions extends EventEmitter {
     record.turn = turn;
     const abort = () => controller.abort();
     signal.addEventListener("abort", abort, { once: true });
-    let cancelTimer;
-    let connection;
+    let cancelTimer: ReturnType<typeof setTimeout> | undefined;
+    let connection: AcpClient | undefined;
     let started = false;
     const cancel = () => {
-      if (!started || connection.failure) return;
+      if (!started || !connection || connection.failure) return;
       connection.notify("session/cancel", { sessionId: record.id });
       // A hung agent cannot keep a cancelled request (and its permission UI) alive forever.
-      cancelTimer = setTimeout(() => connection.dispose(), 5000);
+      const active = connection;
+      cancelTimer = setTimeout(() => active.dispose(), 5000);
     };
     controller.signal.addEventListener("abort", cancel, { once: true });
 
@@ -160,6 +199,7 @@ class Sessions extends EventEmitter {
       await this.load(record);
       connection = record.connection;
       if (controller.signal.aborted) return { stopReason: "cancelled" };
+      if (!connection) throw new Error(`[Sessions.prompt] Missing connection sessionId=${record.id}`);
 
       record.history.push({ role: "user", text });
       if (record.label === "New OpenCode session") record.label = text.slice(0, 80);
@@ -185,5 +225,3 @@ class Sessions extends EventEmitter {
     this.client?.dispose();
   }
 }
-
-module.exports = { Sessions };

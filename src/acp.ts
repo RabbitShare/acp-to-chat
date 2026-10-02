@@ -1,20 +1,48 @@
-"use strict";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { StringDecoder } from "node:string_decoder";
+import { errorMessage, isObject } from "./protocol";
 
-const { spawn } = require("node:child_process");
-const { EventEmitter } = require("node:events");
-const { StringDecoder } = require("node:string_decoder");
+interface ClientOptions {
+  cwd?: string;
+  onRequest?: (method: string, params: unknown) => unknown | Promise<unknown>;
+  onLog?: (text: string) => void;
+}
 
-class AcpClient extends EventEmitter {
-  constructor(command, args, { cwd, onRequest, onLog = () => {} }) {
+type RequestId = string | number | null;
+type OutgoingMessage =
+  | { method: string; params: unknown; id?: RequestId }
+  | { id: RequestId; result: unknown }
+  | { id: RequestId; error: { code: number; message: string } };
+
+interface PendingRequest {
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
+  timer?: ReturnType<typeof setTimeout>;
+  method: string;
+}
+
+export class AcpClient extends EventEmitter<{ notification: [method: string, params: unknown]; failure: [error: Error] }> {
+  pending: Map<RequestId, PendingRequest>;
+  nextId: number;
+  buffer: string;
+  decoder: StringDecoder;
+  onRequest: ClientOptions["onRequest"];
+  child: ChildProcessWithoutNullStreams;
+  failure?: Error;
+  disposing = false;
+  capabilities: { loadSession?: boolean } = {};
+
+  constructor(command: string, args: string[], { cwd, onRequest, onLog = () => {} }: ClientOptions) {
     super();
-    this.pending = new Map();
+    this.pending = new Map<RequestId, PendingRequest>();
     this.nextId = 0;
     this.buffer = "";
     this.decoder = new StringDecoder("utf8");
     this.onRequest = onRequest;
     this.child = spawn(command, args, { cwd, shell: false, stdio: ["pipe", "pipe", "pipe"] });
 
-    this.child.stdout.on("data", (chunk) => {
+    this.child.stdout.on("data", (chunk: Buffer) => {
       try {
         this.buffer += this.decoder.write(chunk);
 
@@ -29,26 +57,26 @@ class AcpClient extends EventEmitter {
           if (line.trim()) this.receive(JSON.parse(line));
         }
       } catch (error) {
-        this.fail(new Error(`[AcpClient.receive] Invalid ACP protocol/JSON: ${error.message}`));
+        this.fail(new Error(`[AcpClient.receive] Invalid ACP protocol/JSON: ${errorMessage(error)}`));
         this.child.kill();
       }
     });
-    this.child.stderr.on("data", (chunk) => onLog(chunk.toString()));
+    this.child.stderr.on("data", (chunk: Buffer) => onLog(chunk.toString()));
     this.child.stdin.on("error", (error) => this.fail(new Error(`[AcpClient.write] ${error.message}`)));
     this.child.on("error", (error) => this.fail(new Error(`[AcpClient.spawn] command=${command} cwd=${cwd}: ${error.message}`)));
     this.child.on("close", (code, signal) => this.fail(new Error(`[AcpClient.exit] code=${code} signal=${signal}`)));
   }
 
-  write(message) {
+  write(message: OutgoingMessage) {
     if (this.failure) throw this.failure;
     this.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\n");
   }
 
-  request(method, params, timeout = 30000) {
+  request(method: string, params: unknown, timeout = 30000): Promise<unknown> {
     if (this.failure) return Promise.reject(this.failure);
 
     const id = this.nextId++;
-    return new Promise((resolve, reject) => {
+    return new Promise<unknown>((resolve, reject) => {
       const timer = timeout > 0 ? setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`[AcpClient.request] method=${method} id=${id} timed out after ${timeout}ms`));
@@ -66,24 +94,29 @@ class AcpClient extends EventEmitter {
     });
   }
 
-  notify(method, params) {
+  notify(method: string, params: unknown) {
     this.write({ method, params });
   }
 
-  receive(message) {
-    if (!message || message.jsonrpc !== "2.0") {
+  receive(message: unknown) {
+    if (!isObject(message) || message.jsonrpc !== "2.0") {
       throw new Error("[AcpClient.receive] Missing JSON-RPC 2.0 envelope");
     }
 
     if (typeof message.method === "string") {
       if (message.id !== undefined) {
-        this.answer(message).catch((error) => this.fail(error));
+        if (message.id !== null && typeof message.id !== "string" && typeof message.id !== "number") {
+          throw new Error("[AcpClient.receive] Invalid request id");
+        }
+        this.answer({ id: message.id, method: message.method, params: message.params }).catch((error: unknown) =>
+          this.fail(error instanceof Error ? error : new Error(errorMessage(error))));
       } else {
         this.emit("notification", message.method, message.params);
       }
       return;
     }
 
+    if (message.id !== null && typeof message.id !== "string" && typeof message.id !== "number") return;
     const request = this.pending.get(message.id);
     if (!request) return;
 
@@ -91,7 +124,8 @@ class AcpClient extends EventEmitter {
     clearTimeout(request.timer);
 
     if (message.error) {
-      request.reject(new Error(`[AcpClient.request] method=${request.method} id=${message.id} code=${message.error.code}: ${message.error.message}`));
+      const error = isObject(message.error) ? message.error : {};
+      request.reject(new Error(`[AcpClient.request] method=${request.method} id=${message.id} code=${error.code}: ${error.message}`));
     } else if ("result" in message) {
       request.resolve(message.result);
     } else {
@@ -99,20 +133,20 @@ class AcpClient extends EventEmitter {
     }
   }
 
-  async answer(message) {
-    let response;
+  async answer(message: { id: RequestId; method: string; params: unknown }) {
+    let response: { result: unknown } | { error: { code: number; message: string } };
 
     try {
       if (!this.onRequest) throw new Error("Unsupported client request");
       response = { result: await this.onRequest(message.method, message.params) };
     } catch (error) {
-      response = { error: { code: -32601, message: `[AcpClient.answer] method=${message.method}: ${error.message}` } };
+      response = { error: { code: -32601, message: `[AcpClient.answer] method=${message.method}: ${errorMessage(error)}` } };
     }
 
     if (!this.failure) this.write({ id: message.id, ...response });
   }
 
-  fail(error) {
+  fail(error: Error) {
     if (this.failure) return;
     this.failure = error;
 
@@ -140,5 +174,3 @@ class AcpClient extends EventEmitter {
     });
   }
 }
-
-module.exports = { AcpClient };

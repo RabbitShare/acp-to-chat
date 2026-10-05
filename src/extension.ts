@@ -1,7 +1,8 @@
 import { isAbsolute } from "node:path";
 import { Sessions, type SavedSession, type SessionRecord, type SessionStatus } from "./sessions";
 import type * as VSCode from "vscode";
-import { errorMessage, isObject, isTextContent, type PermissionParams, type SessionUpdate } from "./protocol";
+import type { RequestPermissionRequest, SessionUpdate, ToolCallUpdate } from "@agentclientprotocol/sdk";
+import { errorMessage, isObject, isTextContent } from "./protocol";
 
 export type EditorApi = Pick<typeof VSCode,
   "MarkdownString" | "ChatResponseMarkdownPart" | "ChatResponseThinkingProgressPart" |
@@ -9,7 +10,7 @@ export type EditorApi = Pick<typeof VSCode,
   window: Pick<typeof VSCode.window, "createQuickPick" | "showWorkspaceFolderPick" | "showErrorMessage" | "createOutputChannel">;
   workspace: Pick<typeof VSCode.workspace, "isTrusted" | "workspaceFolders" | "getConfiguration">;
   chat: Pick<typeof VSCode.chat, "createChatParticipant" | "createChatSessionItemController" | "registerChatSessionContentProvider">;
-  lm: Pick<typeof VSCode.lm, "registerLanguageModelChatProvider">;
+  lm: Pick<typeof VSCode.lm, "registerLanguageModelChatProvider" | "selectChatModels">;
   commands: Pick<typeof VSCode.commands, "registerCommand" | "executeCommand">;
 };
 
@@ -18,7 +19,7 @@ export interface AdapterContext {
   workspaceState: Pick<VSCode.Memento, "get" | "update">;
 }
 
-type ToolState = SessionUpdate & { toolCallId: string };
+type ToolState = ToolCallUpdate;
 type RenderedPart = VSCode.ChatResponseMarkdownPart | VSCode.ChatResponseThinkingProgressPart | VSCode.ChatToolInvocationPart;
 type NativeSession = Omit<VSCode.ChatSession, "requestHandler"> & { requestHandler: VSCode.ChatRequestHandler };
 
@@ -46,9 +47,15 @@ export function renderUpdate(vscode: Pick<EditorApi, "MarkdownString" | "ChatRes
     return new vscode.ChatResponseThinkingProgressPart(update.content.text);
   }
 
-  if (["tool_call", "tool_call_update"].includes(update.sessionUpdate) && typeof update.toolCallId === "string") {
+  if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
     const previous = tools.get(update.toolCallId);
-    const tool: ToolState = { ...previous, ...Object.fromEntries(Object.entries(update).filter(([, value]) => value !== null && value !== undefined)), sessionUpdate: update.sessionUpdate, toolCallId: update.toolCallId };
+    const tool: ToolState = {
+      toolCallId: update.toolCallId,
+      name: update.name ?? previous?.name, kind: update.kind ?? previous?.kind,
+      title: update.title ?? previous?.title, status: update.status ?? previous?.status,
+      rawInput: update.rawInput ?? previous?.rawInput, rawOutput: update.rawOutput ?? previous?.rawOutput,
+      content: update.content ?? previous?.content,
+    };
     tools.set(update.toolCallId, tool);
     const part = new vscode.ChatToolInvocationPart(tool.name ?? tool.kind ?? "OpenCode tool", tool.toolCallId);
     part.invocationMessage = tool.title ?? tool.toolCallId;
@@ -62,7 +69,7 @@ export function renderUpdate(vscode: Pick<EditorApi, "MarkdownString" | "ChatRes
   }
 }
 
-export function choosePermission(vscode: { window: Pick<EditorApi["window"], "createQuickPick"> }, params: PermissionParams, signal: AbortSignal): Promise<string | undefined> {
+export function choosePermission(vscode: { window: Pick<EditorApi["window"], "createQuickPick"> }, params: RequestPermissionRequest, signal: AbortSignal): Promise<string | undefined> {
   if (signal.aborted) return Promise.resolve(undefined);
 
   return new Promise<string | undefined>((resolve) => {
@@ -245,8 +252,18 @@ export function register(vscode: EditorApi, context: AdapterContext, backend: Se
 
           try {
             if (abort.signal.aborted) return {};
+            if (request.attempt > 0) {
+              throw new Error("Retry is disabled: ACP does not replace completed messages. Open the saved session; if history has not been restored, run Developer: Reload Window and open it again. Send a new message.");
+            }
             const currentResource = chatContext.chatSessionContext?.chatSessionItem.resource ?? resource;
             const current = await recordFor(currentResource, request.prompt, requestToken);
+            // Native edit/Retry can shorten history before invoking us. Never append
+            // that replacement to the unchanged ACP conversation, even via a command.
+            const nativeRequests = (chatContext.history ?? []).filter((turn) => turn instanceof vscode.ChatRequestTurn2);
+            const previousRequests = current.history.filter((turn) => turn.role === "user");
+            if (previousRequests.some((turn, index) => nativeRequests[index]?.prompt !== turn.text)) {
+              throw new Error("Editing sent messages is disabled: ACP does not support history rollback. Open the saved session; if history has not been restored, run Developer: Reload Window and open it again. Send a new message.");
+            }
             const tools = new Map<string, ToolState>();
             await backend.prompt(current, request.prompt, abort.signal, (update) => {
               const part = renderUpdate(vscode, update, tools);
@@ -273,7 +290,7 @@ export function register(vscode: EditorApi, context: AdapterContext, backend: Se
   return controller;
 }
 
-export function activateWithApi(vscode: EditorApi, context: AdapterContext) {
+export async function activateWithApi(vscode: EditorApi, context: AdapterContext) {
   const output = vscode.window.createOutputChannel("OpenCode Native Chat");
   context.subscriptions.push(output);
   const backend = new Sessions({
@@ -284,7 +301,11 @@ export function activateWithApi(vscode: EditorApi, context: AdapterContext) {
   });
 
   try {
-    return register(vscode, context, backend);
+    const controller = register(vscode, context, backend);
+    // Registration alone does not populate the VS Code 1.140.0 model cache.
+    // Discover only our metadata bridge; this never requests model generation.
+    await vscode.lm.selectChatModels({ vendor: SESSION_TYPE });
+    return controller;
   } catch (error) {
     backend.dispose();
     vscode.window.showErrorMessage(`[activate] ${errorMessage(error)}`);

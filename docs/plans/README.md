@@ -1,22 +1,24 @@
 # Plans for further work
 
-Status as of October 2, 2026. The user stopped diagnosis and requested only that further plans be saved. These documents **do not authorize continued implementation**, model execution, package installation, configuration changes, or Git operations without a new request.
+Updated October 5, 2026. After the plans were saved, the TypeScript/SDK migrations were executed separately; the user requested a temporary editing restriction, investigation of test failures, and then verification of the bundles in the editor. The fourth document retains the future model/reasoning selection plan. Recording other tasks here does not automatically authorize their execution or Git operations.
 
 ## Current stopping point
 
-- At the diagnosis stopping point, before migration 01, the extension ran on JavaScript with a custom ACP transport; TypeScript, a build step, and the SDK had not yet been introduced. After the separately requested migration 01, `src/*.ts` and CommonJS bundles in `dist/` are current; the custom ACP transport is retained, and the SDK has not yet been introduced.
+- TypeScript/esbuild and SDK 1.7.0 with zod 3.25.76 have been introduced: `src/*.ts` and CommonJS bundles in `dist/` are current. The native UI on the new bundles requires a separate run.
 - The user reported a message editing/retry defect: the response appears "every other time", and the old message/response is not replaced as expected.
-- A failing test was added to `test/extension.test.js`: `editing a completed native request replaces its turn instead of appending another`. There are no runtime fixes.
-- The user reported the result of checking the sources at a specific tag and the complete list of ACP handlers: **OpenCode 2.0.21 does not provide replacement or rollback of a completed message in the same session through ACP**. This is a version limitation, not an open search for a method. The editing/Retry UX still needs agreement; the "every other time" symptom requires separate diagnosis.
+- A new request introduced a temporary edit/Retry restriction: empty session capabilities and a check in the shared handler before the ACP prompt. The previous replacement expectation was replaced with tests for rejection without changing backend history and for an ordinary new Send; this does not implement rollback.
+- The user reported the result of checking the sources at a specific tag and the complete list of ACP handlers: **OpenCode 2.0.21 does not provide replacement or rollback of a completed message in the same session through ACP**. This is a version limitation, not an open search for a method. The current temporary restriction is agreed; the future replacement/fork UX requires a separate decision, and the "every other time" symptom requires separate diagnosis.
 - [Plan 03, section 4.1](03-native-resend-and-verification.md#41-a-branch-before-the-selected-message-contract-and-saved-option) retains the v2.0.21 source review and an option: a manual selective fork **before the message** in OpenCode, followed by a separate explicit branch attach by ID/cwd through ACP `session/load`. This is not implemented, is not automatic edit/Retry, and does not authorize implementation; proactive snapshots were not selected.
 - The temporary `opencode.jsonc` remains in the root and requests permission only for `pwd`. Its removal was approved after verification; before deleting it, confirm that the user has not changed the file.
-- The last successful full run **before adding the new test**: 41 passed and a successful `npm run check`. This is not a current green status: the new test failed when run separately.
+- Fresh baseline before the restriction: 90 tests, 89 pass, 1 replacement failure; the previous transport deadline failures did not reproduce. For subsequent results, see the current verification section in the root README.
+- Current result on October 5: 103/103 unit tests, build/strict types/check pass. After fixing the smoke runner and model discovery, native Send, streaming, tool/Allow/Reject/Escape, both Stop scenarios, and history/continuation after Reload were manually confirmed. The user requested retaining the implementation for now; a full restart, the native UI edit/Retry restriction, and temporary config cleanup remain incomplete. Detailed evidence and boundaries are in README.
 
 ## Documents and order
 
 1. [01-typescript-build.md](01-typescript-build.md) — the previously saved migration plan for TypeScript, `import`/`export`, and a small build step. Do not combine it with the resubmission fix.
 2. [02-acp-sdk.md](02-acp-sdk.md) — the previously saved migration plan for the official ACP SDK; follows plan 01.
 3. [03-native-resend-and-verification.md](03-native-resend-and-verification.md) — an independent track for editing/Retry, fork, and native validation: the ACP 2.0.21 limitation, UX agreement, missing-response diagnosis, remaining native UI checks, cleanup, and final verification.
+4. [04-model-and-reasoning.md](04-model-and-reasoning.md) — a plan for backend model and reasoning effort/variant selection through ACP with a session-specific native picker. Not yet implemented.
 
 **Dependency rule:** plans 01 and 02 may be executed on a separate request without completing plan 03; plan 02 depends only on plan 01. Plan 03 does not block the migrations and is not their mandatory first stage.
 

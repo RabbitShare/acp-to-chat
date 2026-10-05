@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
+import type { RequestPermissionRequest, RequestPermissionResponse, SessionUpdate } from "@agentclientprotocol/sdk";
 import { AcpClient } from "./acp";
-import { errorMessage, isObject, isPermissionParams, isSessionUpdate, isTextContent, type PermissionParams, type SessionUpdate } from "./protocol";
+import { errorMessage, isObject, readPermissionParams, readSessionNotification, readOptionalString, isTextContent } from "./protocol";
 
 export interface SavedSession {
   id: string;
@@ -26,7 +27,7 @@ interface SessionOptions {
   command: string;
   args?: string[];
   cwd?: string;
-  permission: (params: PermissionParams, signal: AbortSignal) => string | undefined | Promise<string | undefined>;
+  permission: (params: RequestPermissionRequest, signal: AbortSignal) => string | undefined | Promise<string | undefined>;
   onLog?: (text: string) => void;
 }
 
@@ -123,22 +124,24 @@ export class Sessions extends EventEmitter<{ status: [record: SessionRecord, sta
   }
 
   update(params: unknown) {
-    if (!isObject(params) || typeof params.sessionId !== "string" || !isSessionUpdate(params.update)) return;
-    const { sessionId, update } = params;
+    const notification = readSessionNotification(params);
+    if (!notification) return;
+    const { sessionId, update } = notification;
     const record = this.records.get(sessionId);
     if (!record) return;
 
+    const messageId = readOptionalString(update, "messageId");
     if (update.sessionUpdate === "user_message_chunk" && isTextContent(update.content)) {
       const last = record.history.at(-1);
-      if (last?.role === "user" && last.messageId === update.messageId) {
+      if (last?.role === "user" && last.messageId === messageId) {
         last.text += update.content.text;
       } else {
-        record.history.push({ role: "user", text: update.content.text, messageId: update.messageId });
+        record.history.push({ role: "user", text: update.content.text, messageId });
       }
     } else if (["agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"].includes(update.sessionUpdate)) {
       let last = record.history.at(-1);
-      if (last?.role !== "assistant" || (update.messageId && last.messageId && update.messageId !== last.messageId)) {
-        last = { role: "assistant", updates: [], messageId: update.messageId };
+      if (last?.role !== "assistant" || (messageId && last.messageId && messageId !== last.messageId)) {
+        last = { role: "assistant", updates: [], messageId };
         record.history.push(last);
       }
       last.updates.push(update);
@@ -147,13 +150,14 @@ export class Sessions extends EventEmitter<{ status: [record: SessionRecord, sta
     if (record.turn && !record.turn.controller.signal.aborted) record.turn.onUpdate(update);
   }
 
-  async requestPermission(method: string, params: unknown) {
+  async requestPermission(method: string, rawParams: unknown): Promise<RequestPermissionResponse> {
     if (method !== "session/request_permission") {
       throw new Error(`[Sessions.requestPermission] Unsupported method=${method}`);
     }
 
-    const cancelled = { outcome: { outcome: "cancelled" } };
-    if (!isPermissionParams(params)) return cancelled;
+    const cancelled: RequestPermissionResponse = { outcome: { outcome: "cancelled" } };
+    const params = readPermissionParams(rawParams);
+    if (!params) return cancelled;
     const record = this.records.get(params.sessionId);
     const turn = record?.turn;
     if (!record || !turn || turn.controller.signal.aborted) return cancelled;
@@ -162,7 +166,7 @@ export class Sessions extends EventEmitter<{ status: [record: SessionRecord, sta
 
     try {
       const optionId = await this.options.permission(params, turn.controller.signal);
-      if (turn.controller.signal.aborted || record.turn !== turn || !params.options.some((option) => option.optionId === optionId)) {
+      if (typeof optionId !== "string" || turn.controller.signal.aborted || record.turn !== turn || !params.options.some((option) => option.optionId === optionId)) {
         return cancelled;
       }
       return { outcome: { outcome: "selected", optionId } };
@@ -188,9 +192,11 @@ export class Sessions extends EventEmitter<{ status: [record: SessionRecord, sta
     let started = false;
     const cancel = () => {
       if (!started || !connection || connection.failure) return;
-      connection.notify("session/cancel", { sessionId: record.id });
-      // A hung agent cannot keep a cancelled request (and its permission UI) alive forever.
       const active = connection;
+      void active.notify("session/cancel", { sessionId: record.id }).catch((error: unknown) => {
+        active.fail(new Error(`[Sessions.prompt] session/cancel sessionId=${record.id}: ${errorMessage(error)}`));
+      });
+      // A hung agent cannot keep a cancelled request (and its permission UI) alive forever.
       cancelTimer = setTimeout(() => active.dispose(), 5000);
     };
     controller.signal.addEventListener("abort", cancel, { once: true });

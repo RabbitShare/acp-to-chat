@@ -54,6 +54,12 @@ lines.on("line", (line) => {
     process.stdout.write("not json\n");
   } else if (message.method === "invalid-request-id") {
     send({ id: {}, method: "client/callback", params: {} });
+  } else if (message.method === "invalid-envelope") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "1.0", id: "unmatched", result: {} }) + "\n");
+  } else if (message.method === "oversized") {
+    send({ id: message.id, result: { text: "🌍".repeat(5 * 1024 * 1024) } });
+  } else if (message.method === "stdout-eof") {
+    process.stdout.end();
   } else if (message.method === "client-callback") {
     callbackRequestId = message.id;
     send({ id: "callback-1", method: "client/callback", params: {} });
@@ -75,6 +81,12 @@ lines.on("line", (line) => {
   } else if (message.method === "session/load") {
     send({ method: "session/update", params: { sessionId: message.params.sessionId, update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "previous question" } } } });
     send({ method: "session/update", params: { sessionId: message.params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "previous answer" } } } });
+    if (scenario === "tool-content-replay") send({ method: "session/update", params: { sessionId: message.params.sessionId, update: {
+      sessionUpdate: "tool_call", toolCallId: "replayed-tool", title: "Validation", status: "completed", content: [
+        { type: "content", _meta: { wrapper: "replayed" }, content: { type: "image", data: "replayed-image", mimeType: "image/png", uri: "file:///replayed-image", annotations: { audience: ["user"], priority: 0.75 }, _meta: { source: "history" } } },
+        { type: "content", content: { type: "resource_link", uri: "file:///report", name: "report", title: "Validation result", description: "2 tests failed", mimeType: "text/plain", size: 10, annotations: null, _meta: null } },
+      ],
+    } } });
     send({ id: message.id, result: {} });
   } else if (message.method === "session/prompt") {
     const sessionId = message.params.sessionId;
@@ -85,10 +97,21 @@ lines.on("line", (line) => {
     const permissionId = `permission-${message.id}`;
     pending.set(sessionId, { id: message.id, cancelled: false });
     permissions.set(permissionId, sessionId);
+    if (scenario === "malformed-updates") {
+      for (const update of [
+        { sessionUpdate: "agent_message_chunk", messageId: {}, content: { type: "text", text: "bad message ID" } },
+        { sessionUpdate: "tool_call_update", toolCallId: "bad", name: 42 },
+        { sessionUpdate: "tool_call_update", toolCallId: "bad", title: 42 },
+        { sessionUpdate: "tool_call_update", toolCallId: "bad", kind: "invented" },
+        { sessionUpdate: "tool_call_update", toolCallId: "bad", status: "invented" },
+      ]) send({ method: "session/update", params: { sessionId, update } });
+    }
     send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `answer:${message.params.prompt[0].text}` } } } });
     const permission = { sessionId, toolCall: { toolCallId: `tool-${sessionId}`, title: "Run command", rawInput: { command: "pwd" } }, options: [{ optionId: "yes", name: "Allow once", kind: "allow_once" }, { optionId: "no", name: "Reject", kind: "reject_once" }] };
     if (scenario === "malformed-permission-tool") permission.toolCall.toolCallId = 1;
     if (scenario === "malformed-permission-option") permission.options[0].name = null;
+    if (scenario === "malformed-permission-title") permission.toolCall.title = 42;
+    if (scenario === "malformed-permission-kind") permission.options[0].kind = "not-an-ACP-permission-kind";
     send({ id: permissionId, method: "session/request_permission", params: permission });
     if (scenario === "crash-prompt") setTimeout(() => process.exit(8), 100);
   } else if (message.method === "session/cancel") {
@@ -99,7 +122,7 @@ lines.on("line", (line) => {
     const turn = pending.get(sessionId);
     if (scenario === "ignore-cancel" && turn?.cancelled) return;
     send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: `tool-${sessionId}`, title: "Run command", status: "completed", rawOutput: message.result } } });
-    if (turn) send({ id: turn.id, result: { stopReason: turn.cancelled ? "cancelled" : "end_turn", permission: message.result, cwd: workingDirectories.get(sessionId) } });
+    if (turn) send({ id: turn.id, result: { stopReason: turn.cancelled ? "cancelled" : "end_turn", _meta: { permission: message.result, cwd: workingDirectories.get(sessionId) } } });
     pending.delete(sessionId);
     permissions.delete(message.id);
   }

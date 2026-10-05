@@ -91,6 +91,62 @@ test("native model bridge publishes session-scoped metadata without starting ACP
   assert.ok(context.subscriptions.includes(entry.registration));
 });
 
+test("activation discovers the OpenCode model bridge in a fresh editor catalogue without starting ACP", async (t) => {
+  const { vscode, context, modelProviders } = api();
+  t.after(() => context.subscriptions.forEach((subscription) => subscription.dispose()));
+  vscode.workspace.getConfiguration = () => ({ get: (_key, fallback) => fallback });
+  let discovered = [];
+  let releaseDiscovery;
+  const discovery = new Promise((resolve) => { releaseDiscovery = resolve; });
+  vscode.lm.selectChatModels = async (selector) => {
+    assert.deepEqual(selector, { vendor: "opencode" }, "Discovery must not query other providers");
+    const entry = modelProviders.get("opencode");
+    assert.ok(entry, "Register the provider before requesting discovery");
+    discovered = await entry.provider.provideLanguageModelChatInformation({ silent: true }, token);
+    await discovery;
+    return discovered;
+  };
+  let activated = false;
+  const activation = extension.activateWithApi(vscode, context).then((controller) => {
+    activated = true;
+    return controller;
+  });
+  // Flush microtasks, but hold the actual host discovery response unresolved.
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(activated, false, "Activation must not finish while discovery is pending");
+  releaseDiscovery();
+  const controller = await activation;
+  assert.ok(controller);
+  assert.deepEqual(discovered.map((model) => model.name), ["OpenCode (configured)"]);
+  // extension.js bundles its own Sessions constructor; inspect its public state.
+  const backend = context.subscriptions.find((subscription) => subscription.records instanceof Map);
+  assert.ok(backend);
+  assert.equal(backend.client, undefined);
+  assert.equal(backend.records.size, 0);
+});
+
+test("activation reports model discovery rejection and disposes the backend without starting ACP", async (t) => {
+  const { vscode, context } = api();
+  t.after(() => context.subscriptions.forEach((subscription) => subscription.dispose()));
+  vscode.workspace.getConfiguration = () => ({ get: (_key, fallback) => fallback });
+  const error = new Error("OpenCode catalogue discovery failed");
+  let backend;
+  let disposed = false;
+  vscode.lm.selectChatModels = async () => {
+    backend = context.subscriptions.find((subscription) => subscription.records instanceof Map);
+    const dispose = backend.dispose.bind(backend);
+    t.mock.method(backend, "dispose", () => { disposed = true; return dispose(); });
+    throw error;
+  };
+  const messages = [];
+  vscode.window.showErrorMessage = (message) => { messages.push(message); };
+  await assert.rejects(extension.activateWithApi(vscode, context), (actual) => actual === error);
+  assert.deepEqual(messages, ["[activate] OpenCode catalogue discovery failed"]);
+  assert.equal(disposed, true);
+  assert.equal(backend.client, undefined);
+});
+
 test("native model bridge reports unavailable token counting without starting ACP", async (t) => {
   const { vscode, context, modelProviders } = api();
   const backend = new Sessions({ command: process.execPath, cwd: __dirname, permission: async () => "no" });
@@ -218,24 +274,109 @@ test("session-type participant routes a materialized native request to ACP", asy
   assert.deepEqual(text, ["answer:native question"]);
 });
 
-test("editing a completed native request replaces its turn instead of appending another", async (t) => {
+for (const untitled of [false, true]) test(`native editing is rejected without appending an ACP turn (${untitled ? "untitled" : "saved"})`, async (t) => {
   const { vscode, context, controller, participants } = api();
   const backend = new Sessions({ command: process.execPath, args: [path.join(__dirname, "fixtures/agent.cjs")], cwd: __dirname, permission: async () => "no" });
   t.after(() => backend.dispose());
   extension.register(vscode, context, backend);
-  const item = await controller.newChatSessionItemHandler({ request: { prompt: "original" } }, token);
+  const item = untitled ? { resource: vscode.Uri.from({ scheme: "opencode", path: "/untitled-edit" }) }
+    : await controller.newChatSessionItemHandler({ request: { prompt: "original" } }, token);
   const handler = participants.get("opencode");
-  // VS Code drops the edited request from context.history and gives its replacement a new request ID.
-  for (const [index, prompt] of ["original", "replacement"].entries()) {
-    const text = [];
-    await handler({ id: `request-${index}`, prompt, attempt: 0 }, {
-      history: [], chatSessionContext: { chatSessionItem: item },
-    }, { markdown: (value) => text.push(value.value), push() {} }, token);
-    assert.deepEqual(text, [`answer:${prompt}`], "Every send must stream its own answer");
-  }
-  const restored = await vscode.provider.provideChatSessionContent(item.resource, token);
-  assert.deepEqual(restored.history.filter((turn) => turn instanceof vscode.ChatRequestTurn2).map((turn) => turn.prompt),
-    ["replacement"], "The replaced request must not return when the native history is reopened");
+  const chatContext = { history: [], chatSessionContext: { chatSessionItem: item } };
+  const text = [];
+  const stream = { markdown: (value) => text.push(value.value), push() {} };
+  await handler({ id: "original", prompt: "original", attempt: 0 }, chatContext, stream, token);
+  assert.deepEqual(text, ["answer:original"]);
+  // Editing drops the old turn from native context; ACP cannot replace it.
+  await assert.rejects(handler({ id: "edited", prompt: "replacement", attempt: 0 }, chatContext, stream, token), /editing/i);
+  assert.deepEqual(text, ["answer:original"], "Rejected edit must not stream a second model answer");
+  const record = [...backend.records.values()][0];
+  const restored = await vscode.provider.provideChatSessionContent(vscode.Uri.from({ scheme: "opencode", path: `/${record.id}` }), token);
+  assert.deepEqual(restored.history.filter((turn) => turn instanceof vscode.ChatRequestTurn2).map((turn) => turn.prompt), ["original"]);
+});
+
+for (const untitled of [false, true]) test(`native new Send accepts identical prompt text (${untitled ? "untitled" : "saved"})`, async (t) => {
+  const { vscode, context, controller, participants } = api();
+  const backend = new Sessions({ command: process.execPath, args: [path.join(__dirname, "fixtures/agent.cjs")], cwd: __dirname, permission: async () => "no" });
+  t.after(() => backend.dispose());
+  extension.register(vscode, context, backend);
+  const item = untitled ? { resource: vscode.Uri.from({ scheme: "opencode", path: "/untitled-identical" }) }
+    : await controller.newChatSessionItemHandler({ request: { prompt: "original" } }, token);
+  const handler = participants.get("opencode");
+  const chatContext = { history: [], chatSessionContext: { chatSessionItem: item } };
+  const text = [];
+  const stream = { markdown: (value) => text.push(value.value), push() {} };
+  await handler({ id: "first", prompt: "original", attempt: 0 }, chatContext, stream, token);
+  const record = [...backend.records.values()][0];
+  const session = await vscode.provider.provideChatSessionContent(vscode.Uri.from({ scheme: "opencode", path: `/${record.id}` }), token);
+  await handler({ id: "next", prompt: "original", attempt: 0 }, { ...chatContext, history: session.history }, stream, token);
+  assert.deepEqual(text, ["answer:original", "answer:original"]);
+  assert.deepEqual(record.history.filter((turn) => turn.role === "user").map((turn) => turn.text), ["original", "original"]);
+});
+
+for (const changedSecond of [false, true]) test(`native edit rejects ${changedSecond ? "changed second turn" : "nonempty shortened history"} after two completed turns`, async (t) => {
+  const { vscode, context, controller, participants } = api();
+  const backend = new Sessions({ command: process.execPath, args: [path.join(__dirname, "fixtures/agent.cjs")], cwd: __dirname, permission: async () => "no" });
+  t.after(() => backend.dispose());
+  extension.register(vscode, context, backend);
+  const item = await controller.newChatSessionItemHandler({ request: { prompt: "first" } }, token);
+  const handler = participants.get("opencode");
+  const chatContext = { chatSessionContext: { chatSessionItem: item } };
+  const text = [];
+  const stream = { markdown: (value) => text.push(value.value), push() {} };
+  await handler({ prompt: "first", attempt: 0 }, { ...chatContext, history: [] }, stream, token);
+  const first = await vscode.provider.provideChatSessionContent(item.resource, token);
+  await handler({ prompt: "second", attempt: 0 }, { ...chatContext, history: first.history }, stream, token);
+  const complete = await vscode.provider.provideChatSessionContent(item.resource, token);
+  const history = changedSecond ? complete.history.map((turn) => turn instanceof vscode.ChatRequestTurn2 && turn.prompt === "second"
+    ? new vscode.ChatRequestTurn2("changed second") : turn) : complete.history.slice(0, 2);
+  const record = backend.records.get(item.resource.path.slice(1));
+  const before = structuredClone(record.history);
+  await assert.rejects(handler({ prompt: "replacement", attempt: 0 }, { ...chatContext, history }, stream, token), /Editing.*disabled/);
+  assert.deepEqual(text, ["answer:first", "answer:second"]);
+  assert.deepEqual(record.history, before, "Rejected edit must leave every ACP turn unchanged");
+});
+
+test("native Retry is rejected before starting ACP or creating an untitled session", async (t) => {
+  const { vscode, context, participants } = api();
+  const backend = new Sessions({ command: process.execPath, args: [path.join(__dirname, "fixtures/agent.cjs")], cwd: __dirname, permission: async () => "no" });
+  t.after(() => backend.dispose());
+  extension.register(vscode, context, backend);
+  await assert.rejects(participants.get("opencode")({ prompt: "repeat", attempt: 1 }, {
+    history: [], chatSessionContext: { chatSessionItem: { resource: vscode.Uri.from({ scheme: "opencode", path: "/untitled-retry" }) } },
+  }, { markdown() {}, push() {} }, token), /Retry is disabled/i);
+  assert.equal(backend.client, undefined);
+  assert.equal(backend.records.size, 0);
+});
+
+for (const scenario of ["empty", "changed", "missing"]) test(`content handler rejects ${scenario} replayed request history`, async (t) => {
+  const { vscode, context, data } = api();
+  data.set("sessions", [{ id: "saved-edit", cwd: __dirname }]);
+  const backend = new Sessions({ command: process.execPath, args: [path.join(__dirname, "fixtures/agent.cjs")], cwd: __dirname, permission: async () => "no" });
+  t.after(() => backend.dispose());
+  extension.register(vscode, context, backend);
+  const resource = vscode.Uri.from({ scheme: "opencode", path: "/saved-edit" });
+  const session = await vscode.provider.provideChatSessionContent(resource, token);
+  const text = [];
+  const stream = { markdown: (value) => text.push(value.value), push() {} };
+  const history = scenario === "empty" ? [] : scenario === "changed" ? [new vscode.ChatRequestTurn2("changed earlier question")] : undefined;
+  await assert.rejects(session.requestHandler({ prompt: "replacement", attempt: 0 }, { history }, stream, token), /Editing.*disabled/);
+  assert.deepEqual(text, []);
+  assert.deepEqual(backend.records.get("saved-edit").history.filter((turn) => turn.role === "user").map((turn) => turn.text), ["previous question"]);
+});
+
+test("content handler accepts an ordinary next Send after ACP history replay", async (t) => {
+  const { vscode, context, data } = api();
+  data.set("sessions", [{ id: "saved-next", cwd: __dirname }]);
+  const backend = new Sessions({ command: process.execPath, args: [path.join(__dirname, "fixtures/agent.cjs")], cwd: __dirname, permission: async () => "no" });
+  t.after(() => backend.dispose());
+  extension.register(vscode, context, backend);
+  const session = await vscode.provider.provideChatSessionContent(vscode.Uri.from({ scheme: "opencode", path: "/saved-next" }), token);
+  const text = [];
+  const stream = { markdown: (value) => text.push(value.value), push() {} };
+  await session.requestHandler({ prompt: "next", attempt: 0 }, { history: session.history }, stream, token);
+  assert.deepEqual(text, ["answer:next"]);
+  assert.deepEqual(backend.records.get("saved-next").history.filter((turn) => turn.role === "user").map((turn) => turn.text), ["previous question", "next"]);
 });
 
 test("session-type participant does not start ACP for a different chat scheme", async () => {
@@ -284,6 +425,90 @@ test("merges partial tool updates without losing the tool name", () => {
   assert.equal(part.isError, true);
   assert.equal(part.isComplete, true);
   assert.equal(part.toolSpecificData.output, "not allowed");
+});
+
+test("SDK update projection preserves tool content rendering and null partial fallbacks", (t) => {
+  const { vscode } = api();
+  const backend = new Sessions({ command: process.execPath, permission: async () => "no" });
+  t.after(() => backend.dispose());
+  const tools = new Map();
+  const parts = [];
+  const record = { id: "tool-content", cwd: __dirname, history: [], turn: { controller: new AbortController(), onUpdate: (update) => parts.push(extension.renderUpdate(vscode, update, tools)) } };
+  backend.records.set(record.id, record);
+  const content = [
+    { type: "content", _meta: { wrapper: [1, null, { detail: "text" }] }, content: { type: "text", text: "tool text", annotations: { audience: ["user", "assistant"], lastModified: "2026-10-03T00:00:00Z", priority: 0.5, _meta: { note: "visible" } }, _meta: { text: true } } },
+    { type: "content", content: { type: "image", data: "image-data", mimeType: "image/png", uri: "file:///image", annotations: { audience: null, lastModified: null, priority: null, _meta: null }, _meta: null } },
+    { type: "content", content: { type: "image", data: "image-data", mimeType: "image/png", uri: null } },
+    { type: "content", content: { type: "audio", data: "audio-data", mimeType: "audio/wav", annotations: null, _meta: { audio: "details" } } },
+    { type: "content", content: { type: "resource_link", uri: "file:///tool", name: "tool", title: "Tool report", description: "Result details", mimeType: "text/plain", size: 10, annotations: { priority: 0 }, _meta: { link: "details" } } },
+    { type: "content", _meta: null, content: { type: "resource_link", uri: "file:///null", name: "null", title: null, description: null, mimeType: null, size: null } },
+    { type: "content", content: { type: "resource", resource: { uri: "file:///text", text: "embedded text", mimeType: "text/plain", _meta: { embedded: [false, 2] } }, annotations: { audience: [] }, _meta: { resource: "text" } } },
+    { type: "content", content: { type: "resource", resource: { uri: "file:///blob", blob: "blob-data", mimeType: null, _meta: null }, annotations: null, _meta: null } },
+    { type: "diff", path: "/tool", oldText: null, newText: "diff text", _meta: { diff: "details" } },
+    { type: "terminal", terminalId: "terminal", _meta: { terminal: "details" } },
+    { type: "diff", path: "/new", newText: "new file", _meta: null },
+    { type: "terminal", terminalId: "null-terminal", _meta: null },
+  ];
+  backend.update({ sessionId: record.id, update: { sessionUpdate: "tool_call", toolCallId: "tool", name: "bash", title: "Run command", status: "in_progress", rawInput: "input", content } });
+  backend.update({ sessionId: record.id, update: { sessionUpdate: "tool_call_update", toolCallId: "tool", name: null, title: null, status: "completed", rawInput: null, content: null } });
+  assert.equal(parts.length, 2);
+  for (const part of parts) {
+    assert.equal(part.toolName, "bash");
+    assert.equal(part.invocationMessage, "Run command");
+    assert.equal(part.toolSpecificData.input, "input");
+    assert.deepEqual(JSON.parse(part.toolSpecificData.output), content);
+  }
+  assert.equal(parts[1].enablePartialUpdate, true);
+  assert.equal(parts[1].isComplete, true);
+  assert.deepEqual(record.history[0].updates[0].content, content);
+  assert.equal("rawOutput" in record.history[0].updates[0], false);
+  const historyTools = new Map();
+  for (const update of record.history[0].updates) {
+    assert.deepEqual(JSON.parse(extension.renderUpdate(vscode, update, historyTools).toolSpecificData.output), content);
+  }
+});
+
+test("SDK tool content projection omits malformed optional fields without accepting malformed required fields", (t) => {
+  const { vscode } = api();
+  const backend = new Sessions({ command: process.execPath, permission: async () => "no" });
+  t.after(() => backend.dispose());
+  const record = { id: "invalid-content", cwd: __dirname, history: [] };
+  backend.records.set(record.id, record);
+  backend.update({ sessionId: record.id, update: { sessionUpdate: "tool_call", toolCallId: "tool", title: "Tool", content: [
+    { type: "content", _meta: [], content: { type: "image", data: "data", mimeType: "image/png", uri: 42, annotations: { audience: ["system"], lastModified: "2026-10-03T00:00:00Z", priority: "high", _meta: [] }, _meta: "bad" } },
+    { type: "content", content: { type: "resource_link", uri: "file:///tool", name: "tool", title: [], description: 42, mimeType: false, size: 1.5, annotations: [], _meta: false } },
+    { type: "content", content: { type: "text", text: 42, _meta: { valid: true } } },
+    { type: "content", content: { type: "image", data: 42, mimeType: "image/png", uri: "file:///image" } },
+    { type: "content", content: { type: "resource_link", uri: "file:///tool", name: 42, title: "Valid title" } },
+    { type: "content", content: { type: "resource", resource: { uri: 42, text: "text", _meta: {} } } },
+    { type: "diff", path: "/file", newText: 42, _meta: {} },
+    { type: "terminal", terminalId: 42, _meta: {} },
+  ] } });
+  const part = extension.renderUpdate(vscode, record.history[0].updates[0], new Map());
+  assert.deepEqual(JSON.parse(part.toolSpecificData.output), [
+    { type: "content", content: { type: "image", data: "data", mimeType: "image/png", annotations: { lastModified: "2026-10-03T00:00:00Z" } } },
+    { type: "content", content: { type: "resource_link", uri: "file:///tool", name: "tool" } },
+  ]);
+});
+
+test("SDK tool content rendering retains optional fields from independent session/load replay", async (t) => {
+  const { vscode, context, data } = api();
+  const backend = new Sessions({ command: process.execPath, args: [path.join(__dirname, "fixtures/agent.cjs"), "tool-content-replay"], cwd: __dirname, permission: async () => "no" });
+  t.after(() => backend.dispose());
+  data.set("sessions", [{ id: "saved-tool-content", cwd: __dirname }]);
+  extension.register(vscode, context, backend);
+  assert.equal(backend.records.size, 0, "Replay must come from session/load, not seeded application history");
+  const session = await vscode.provider.provideChatSessionContent(vscode.Uri.from({ scheme: "opencode", path: "/saved-tool-content" }), token);
+  const expected = [
+    { type: "content", _meta: { wrapper: "replayed" }, content: { type: "image", data: "replayed-image", mimeType: "image/png", uri: "file:///replayed-image", annotations: { audience: ["user"], priority: 0.75 }, _meta: { source: "history" } } },
+    { type: "content", content: { type: "resource_link", uri: "file:///report", name: "report", title: "Validation result", description: "2 tests failed", mimeType: "text/plain", size: 10, annotations: null, _meta: null } },
+  ];
+  const tool = session.history[1].response.find((part) => part instanceof vscode.ChatToolInvocationPart);
+  assert.ok(tool);
+  assert.deepEqual(JSON.parse(tool.toolSpecificData.output), expected);
+  const update = backend.records.get("saved-tool-content").history[1].updates.at(-1);
+  assert.equal("rawOutput" in update, false);
+  assert.deepEqual(update.content, expected);
 });
 
 test("permission picker dismissal returns no approval", async () => {
@@ -444,5 +669,25 @@ test("smoke checks registration and command execution without using the Local-on
       get activeChatPanelSessionResource() { throw new Error("Local-only getter must not be used for external sessions"); },
     },
   });
+  assert.deepEqual(invoked, ["opencode.newSession"]);
+});
+
+test("smoke entry point uses VS Code API when editor supplies test path and callback", async (t) => {
+  const Module = require("node:module");
+  const load = Module._load;
+  const invoked = [];
+  // Only VS Code's host-provided module is unavailable in the Node runner.
+  const vscode = {
+    workspace: { isTrusted: true },
+    extensions: { getExtension: () => ({ activate: async () => ({ id: "opencode" }) }) },
+    commands: {
+      getCommands: async () => ["workbench.action.chat.openNewChatSessionInPlace.opencode"],
+      executeCommand: async (command) => { invoked.push(command); },
+    },
+  };
+  t.mock.method(Module, "_load", function (id, ...args) {
+    return id === "vscode" ? vscode : Reflect.apply(load, this, [id, ...args]);
+  });
+  await runEditorSmoke(path.join(__dirname, "editor-smoke.cjs"), () => {});
   assert.deepEqual(invoked, ["opencode.newSession"]);
 });

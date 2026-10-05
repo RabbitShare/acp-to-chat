@@ -14,6 +14,8 @@ assert.equal(manifest.contributes.chatSessions.find((session) => session.type ==
   "[check] sessionType=opencode must use its registered model bridge, not the general model pool");
 assert.equal(manifest.contributes.chatSessions.find((session) => session.type === "opencode").supportsAutoModel, false,
   "[check] synthetic Auto cannot satisfy VS Code 1.140.0 request conversion");
+assert.deepEqual(manifest.contributes.chatSessions.find((session) => session.type === "opencode").capabilities, {},
+  "[check] explicit empty session capabilities disable unsupported attachments and checkpoint editing in VS Code 1.140.0");
 assert.ok(manifest.enabledApiProposals.includes("chatProvider"), "[check] session-targeted model metadata requires chatProvider");
 assert.ok(manifest.contributes.languageModelChatProviders.some((provider) => provider.vendor === "opencode"));
 assert.equal(manifest.capabilities.untrustedWorkspaces.supported, false);

@@ -22,6 +22,8 @@ function waitForWorkspaceTrust(vscode, timeout = 180000) {
 }
 
 async function run(vscode = require("vscode")) {
+  // VS Code 1.140.0 invokes run(testPath, callback), not run(vscodeApi).
+  if (typeof vscode === "string") vscode = require("vscode");
   await waitForWorkspaceTrust(vscode);
   const extension = vscode.extensions.getExtension("local.opencode-native-chat");
   assert.ok(extension, "Development extension was not discovered");

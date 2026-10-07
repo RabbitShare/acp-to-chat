@@ -15,6 +15,600 @@ function sessions(t, permission = async () => "no", scenario) {
   return backend;
 }
 
+test("template preparation Stop before submission never sends cancel or history", async (t) => {
+  const backend = sessions(t);
+  const record = await backend.create(__dirname);
+  const stop = new AbortController();
+  let entered, release;
+  const ready = new Promise((resolve) => { entered = resolve; });
+  const prepared = new Promise((resolve) => { release = resolve; });
+  const send = backend.prompt(record, "/review question", stop.signal, () => {}, () => {}, async () => { entered(); return prepared; });
+  await ready;
+  assert.ok(record.turn);
+  stop.abort();
+  release("Expanded question");
+  assert.equal((await send).stopReason, "cancelled");
+  assert.deepEqual(record.history, []);
+  assert.equal(record.turn, undefined);
+  const { traffic } = await backend.client.requestExtension("echo", { control: "stats" });
+  assert.equal(traffic.filter((entry) => ["session/prompt", "session/cancel"].includes(entry.method)).length, 0);
+});
+
+test("template preparation reserves the prompt slot against another Send and config setter", async (t) => {
+  const backend = sessions(t);
+  const record = await backend.create(__dirname);
+  let entered, release;
+  const ready = new Promise((resolve) => { entered = resolve; });
+  const prepared = new Promise((resolve) => { release = resolve; });
+  t.after(() => release('Review question'));
+  const send = backend.prompt(record, '/review question', new AbortController().signal, () => {}, () => {}, async () => { entered(); return prepared; });
+  await ready;
+  await assert.rejects(backend.prompt(record, 'other', new AbortController().signal, () => {}), /already active/);
+  await assert.rejects(backend.setConfigOption(record, 'mode', 'custom-agent', record.configRevision), /already active/);
+  release('Review question');
+  await send;
+  assert.equal(record.turn, undefined);
+});
+
+test("template preparation rechecks references synchronously after async expansion without adding a turn", async (t) => {
+  const backend = sessions(t);
+  const record = await backend.create(__dirname);
+  let revoked = false;
+  await assert.rejects(backend.prompt(record, "/review question", new AbortController().signal, () => {}, () => {
+    assert.ok(revoked, "Must run after template expansion");
+    throw new Error("revoked reference");
+  }, async () => { revoked = true; return "Expanded question"; }), /revoked reference/);
+  assert.deepEqual(record.history, []);
+  assert.equal(record.turn, undefined);
+  const { traffic } = await backend.client.requestExtension("echo", { control: "stats" });
+  assert.equal(traffic.filter((entry) => entry.method === "session/prompt").length, 0);
+});
+
+for (const scenario of ["commands", "commands-after-new"]) test(`commands retain new notifications (${scenario})`, async (t) => {
+  const backend = sessions(t, undefined, scenario);
+  const record = await backend.create(__dirname);
+  await backend.client.requestExtension("echo", { control: "stats" });
+  assert.deepEqual(record.availableCommands, [{ name: "compact", description: "Compact the session" },
+    { name: "review-test", description: "Review project", input: { hint: "files to review" } }]);
+});
+
+test("commands isolate concurrent new catalogs by cwd", async (t) => {
+  const backend = sessions(t, undefined, "commands");
+  const [first, second] = await Promise.all([backend.create(__dirname), backend.create(path.join(__dirname, "fixtures"))]);
+  assert.equal(first.availableCommands[1].name, "review-test");
+  assert.equal(second.availableCommands[1].name, "review-fixtures");
+});
+
+test("commands retain metadata advertised during load", async (t) => {
+  const backend = sessions(t, undefined, "commands");
+  const loaded = await backend.load({ id: "saved", cwd: path.join(__dirname, "fixtures") });
+  assert.deepEqual(loaded.availableCommands, [{ name: "compact", description: "Compact the session" },
+    { name: "review-fixtures", description: "Review project", input: { hint: "files to review" } }]);
+});
+
+test("commands replace a snapshot with projected metadata", async (t) => {
+  const backend = sessions(t, undefined, "commands");
+  const record = await backend.create(__dirname);
+  const replacement = [{ name: "custom", description: "$(zap) [link](command:evil)", input: null, _meta: { secret: "ignored" } }];
+  await backend.client.requestExtension("echo", { control: "update-commands", sessionId: record.id, availableCommands: replacement });
+  assert.deepEqual(record.availableCommands, [{ name: "custom", description: "$(zap) [link](command:evil)", input: null }]);
+});
+
+test("commands reject malformed snapshots atomically", async (t) => {
+  const backend = sessions(t, undefined, "commands");
+  const record = await backend.create(__dirname);
+  const before = structuredClone(record.availableCommands);
+  const duplicate = { name: "custom", description: "Valid" };
+  for (const availableCommands of [undefined, null, {}, [null], [{ name: "", description: "bad" }],
+    [{ name: "bad", description: 42 }], [{ name: "bad", description: "bad", input: {} }],
+    [{ name: "bad", description: "bad", input: { hint: false } }], [duplicate, duplicate],
+    [{ name: "valid", description: "valid" }, { name: "invalid" }]]) {
+    backend.update({ sessionId: record.id, update: { sessionUpdate: "available_commands_update", availableCommands } });
+    assert.deepEqual(record.availableCommands, before);
+  }
+});
+
+test("commands reject raw malformed optional input before SDK salvage", async (t) => {
+  const backend = sessions(t, undefined, "commands");
+  const record = await backend.create(__dirname);
+  const before = structuredClone(record.availableCommands);
+  await backend.client.requestExtension("echo", { control: "update-commands", sessionId: record.id,
+    availableCommands: [{ name: "custom", description: "bad optional input", input: { hint: false } }] });
+  assert.deepEqual(record.availableCommands, before, "Raw malformed input cannot be salvaged into a replacement");
+});
+
+test("commands never materialize unknown sessions outside new", async (t) => {
+  const backend = sessions(t, undefined, "commands");
+  backend.update({ sessionId: "unknown", update: { sessionUpdate: "available_commands_update", availableCommands: [] } });
+  assert.equal(backend.records.has("unknown"), false);
+});
+
+test("commands clear on an empty live catalog and emit refresh", async (t) => {
+  const backend = sessions(t, undefined, "commands");
+  const record = await backend.create(__dirname);
+  const events = [];
+  backend.on("commands", (changed) => events.push(changed.id));
+  await backend.client.requestExtension("echo", { control: "update-commands", sessionId: record.id, availableCommands: [] });
+  assert.deepEqual(record.availableCommands, []);
+  assert.deepEqual(events, [record.id]);
+});
+
+test("commands metadata never enters conversation history", async (t) => {
+  const backend = sessions(t, undefined, "commands");
+  const record = await backend.create(__dirname);
+  await backend.client.requestExtension("echo", { control: "update-commands", sessionId: record.id,
+    availableCommands: [{ name: "live", description: "Live" }] });
+  assert.deepEqual(record.history, []);
+});
+
+test("commands metadata never reaches the active turn renderer", async (t) => {
+  const backend = sessions(t, undefined, "commands");
+  const record = await backend.create(__dirname);
+  const updates = [];
+  record.turn = { controller: new AbortController(), onUpdate: (update) => updates.push(update) };
+  await backend.client.requestExtension("echo", { control: "update-commands", sessionId: record.id,
+    availableCommands: [{ name: "live", description: "Live" }] });
+  assert.deepEqual(updates, []);
+  record.turn = undefined;
+});
+
+test("commands clear on connection failure", async (t) => {
+  const backend = sessions(t, undefined, "commands-no-load");
+  const record = await backend.create(__dirname);
+  assert.ok(record.availableCommands.length);
+  backend.client.dispose();
+  assert.deepEqual(record.availableCommands, []);
+});
+
+test("commands notify consumers after buffered new metadata belongs to a known record", async (t) => {
+  const backend = sessions(t, undefined, "commands");
+  const observed = [];
+  backend.on("commands", (record) => {
+    assert.equal(backend.records.get(record.id), record);
+    observed.push(record.availableCommands.map((command) => command.name));
+  });
+  await backend.create(__dirname);
+  assert.deepEqual(observed, [["compact", "review-test"]]);
+});
+
+for (const [limit, availableCommands] of [
+  ["count", Array.from({ length: 513 }, (_, index) => ({ name: String(index), description: "" }))],
+  ["name", [{ name: "x".repeat(257), description: "" }]],
+  ["description", [{ name: "review", description: "x".repeat(8193) }]],
+  ["hint", [{ name: "review", description: "", input: { hint: "x".repeat(2049) } }]],
+  ["UTF-8 bytes", Array.from({ length: 512 }, (_, index) => ({ name: String(index), description: "🌍".repeat(256) }))],
+]) test(`commands reject oversized ${limit} atomically before native amplification`, async (t) => {
+  const backend = sessions(t, undefined, "commands");
+  const record = await backend.create(__dirname);
+  const before = structuredClone(record.availableCommands);
+  let events = 0;
+  backend.on("commands", () => events++);
+  backend.update({ sessionId: record.id, update: { sessionUpdate: "available_commands_update", availableCommands } });
+  assert.deepEqual(record.availableCommands, before);
+  assert.equal(events, 0);
+});
+
+test("commands reject oversized advertisements through SDK traffic", async (t) => {
+  const backend = sessions(t, undefined, "commands");
+  const record = await backend.create(__dirname);
+  const before = structuredClone(record.availableCommands);
+  await backend.client.requestExtension("echo", { control: "update-commands", sessionId: record.id,
+    availableCommands: Array.from({ length: 513 }, (_, index) => ({ name: String(index), description: "" })) });
+  assert.deepEqual(record.availableCommands, before);
+});
+
+for (const availableCommands of [
+  Array.from({ length: 512 }, (_, index) => ({ name: String(index), description: "" })),
+  [{ name: "x".repeat(256), description: "x".repeat(8192), input: { hint: "x".repeat(2048) } }],
+]) test(`commands accept metadata at supported ${availableCommands.length === 512 ? "count" : "field"} limits`, async (t) => {
+  const backend = sessions(t, undefined, "commands");
+  const record = await backend.create(__dirname);
+  await backend.client.requestExtension("echo", { control: "update-commands", sessionId: record.id, availableCommands });
+  assert.deepEqual(record.availableCommands, availableCommands);
+});
+
+test("commands bound the total pre-new metadata buffer without materializing unknown IDs", async (t) => {
+  const backend = sessions(t, undefined, "commands-buffer-limit");
+  const record = await backend.create(__dirname);
+  assert.equal(record.availableCommands.length, 0, "Over-budget pre-new snapshot is not retained");
+  assert.equal(backend.records.size, 1);
+  await backend.client.requestExtension("echo", { control: "update-commands", sessionId: record.id,
+    availableCommands: [{ name: "live", description: "Live" }] });
+  assert.deepEqual(record.availableCommands, [{ name: "live", description: "Live" }]);
+});
+
+test("commands fresh load clears a nonempty snapshot without advertisement", async (t) => {
+  const backend = sessions(t, undefined, "commands-no-load");
+  const record = await backend.create(__dirname);
+  assert.ok(record.availableCommands.length);
+  record.configValid = false; // Config uncertainty requires fresh load on the same live connection.
+  const connection = backend.client;
+  await backend.load(record);
+  assert.deepEqual(record.availableCommands, []);
+  assert.equal(backend.client, connection);
+  assert.equal((await configTraffic(backend)).filter((entry) => entry.method === "session/load").length, 1);
+});
+
+test("commands failed load revokes metadata advertised during replay", async (t) => {
+  const backend = sessions(t, undefined, "commands-load-error");
+  const snapshots = [];
+  backend.on("commands", (record) => snapshots.push(record.availableCommands.map((command) => command.name)));
+  await assert.rejects(backend.load({ id: "saved", cwd: __dirname }), /load failed after commands/);
+  assert.deepEqual(snapshots, [[], ["compact", "review-test"], []]);
+  assert.deepEqual(backend.records.get("saved").availableCommands, []);
+});
+
+test("config new/load retain per-cwd catalogs", async (t) => {
+  const backend = sessions(t, undefined, "config");
+  const first = await backend.create(__dirname);
+  const second = await backend.create(path.join(__dirname, "fixtures"));
+  assert.equal(first.configOptions[0].currentValue, "provider/test/initial");
+  assert.equal(second.configOptions[0].currentValue, "provider/fixtures/initial");
+  assert.equal(first.configOptions[1].currentValue, "workspace-agent");
+  assert.equal(first.configOptions[2].currentValue, "default");
+  assert.ok(Number.isInteger(first.configRevision));
+  const loaded = await backend.load({ id: "saved", cwd: __dirname });
+  assert.deepEqual(loaded.configOptions, first.configOptions);
+});
+
+test("config new/load default absent/null options to empty catalogs", async (t) => {
+  for (const scenario of [undefined, "config-null"]) {
+    const defaults = sessions(t, undefined, scenario);
+    assert.deepEqual((await defaults.create(__dirname)).configOptions, []);
+    assert.deepEqual((await defaults.load({ id: "saved", cwd: __dirname })).configOptions, []);
+  }
+});
+
+for (const phase of ["new", "load"]) {
+  test(`config rejects malformed present ${phase} catalog rather than defaulting`, async (t) => {
+    const backend = sessions(t, undefined, `config-malformed-${phase}`);
+    const operation = phase === "new" ? backend.create(__dirname) : backend.load({ id: "saved", cwd: __dirname });
+    await assert.rejects(operation, /configOptions/);
+    if (phase === "new") assert.equal(backend.records.size, 0);
+    else {
+      const record = backend.records.get("saved");
+      assert.ok(record);
+      assert.equal(record.configValid, false);
+      assert.equal(record.connection, undefined);
+    }
+  });
+}
+
+test("config updates replace grouped/empty snapshots without history or turn callbacks", async (t) => {
+  const backend = sessions(t, undefined, "config");
+  const record = await backend.create(__dirname);
+  const events = [];
+  const updates = [];
+  backend.on("config", (changed) => events.push(changed));
+  record.turn = { controller: new AbortController(), onUpdate: (update) => updates.push(update) };
+  const revision = record.configRevision;
+  backend.update({ sessionId: record.id, update: { sessionUpdate: "config_option_update", configOptions: [{
+    id: "model", name: "Model", type: "select", category: "future-category", description: null,
+    currentValue: "removed", _meta: { secret: "never project" }, options: [
+      { group: "provider", name: "Provider", _meta: {}, options: [{ value: "provider/model/extra", name: "Available", description: "Details", _meta: {} }] },
+    ],
+  }, { id: "flag", name: "Flag", type: "boolean", currentValue: false }] } });
+  assert.deepEqual(record.configOptions, [{ id: "model", name: "Model", type: "select", category: "future-category", description: null, currentValue: "removed", options: [{ group: "provider", name: "Provider", options: [{ value: "provider/model/extra", name: "Available", description: "Details" }] }] }]);
+  assert.ok(record.configRevision > revision);
+  assert.equal(events.length, 1);
+  assert.equal(events[0], record);
+  backend.update({ sessionId: record.id, update: { sessionUpdate: "config_option_update", configOptions: [] } });
+  assert.deepEqual(record.configOptions, []);
+  assert.deepEqual(record.history, []);
+  assert.deepEqual(updates, []);
+});
+
+test("config malformed update catalogs are rejected atomically before optional salvage", async (t) => {
+  const backend = sessions(t, undefined, "config");
+  const record = await backend.create(__dirname);
+  const original = structuredClone(record.configOptions);
+  const revision = record.configRevision;
+  let events = 0;
+  backend.on("config", () => events++);
+  const select = { id: "model", name: "Model", type: "select", currentValue: "missing", options: [{ value: "one", name: "One" }] };
+  const group = { group: "provider", name: "Provider", options: [{ value: "one", name: "One" }] };
+  for (const configOptions of [
+    undefined, null, {}, [null],
+    ...["id", "name", "currentValue"].flatMap((key) => [[{ ...select, [key]: "" }], [{ ...select, [key]: 42 }]]),
+    [{ ...select, category: {} }], [{ ...select, description: 42 }],
+    [select, select], [{ ...select, options: null }],
+    [{ ...select, options: [{ value: "", name: "Empty" }] }],
+    [{ ...select, options: [{ value: "one", name: "" }] }],
+    [{ ...select, options: [{ value: "one", name: "One", description: false }] }],
+    [{ ...select, options: [select.options[0], select.options[0]] }],
+    [{ ...select, options: [group, select.options[0]] }],
+    [{ ...select, options: [group, group] }],
+    [{ ...select, options: [group, { ...group, group: "other" }] }],
+    [{ ...select, options: [{ ...group, group: "" }] }],
+    [{ ...select, options: [{ ...group, name: "" }] }],
+    [{ ...select, options: [{ ...group, options: [group] }] }],
+  ]) {
+    backend.update({ sessionId: record.id, update: { sessionUpdate: "config_option_update", configOptions } });
+    assert.deepEqual(record.configOptions, original);
+    assert.equal(record.configRevision, revision);
+  }
+  assert.equal(events, 0);
+});
+
+function configBarrier(t, connection) {
+  return new Promise((resolve) => {
+    const listener = (method, params) => {
+      if (method !== "session/update" || params._meta?.fixture !== "config_pending") return;
+      connection.off("notification", listener);
+      resolve();
+    };
+    connection.on("notification", listener);
+    t.after(() => connection.off("notification", listener));
+  });
+}
+
+async function configTraffic(backend) {
+  return (await backend.client.requestExtension("echo", { control: "stats" })).traffic;
+}
+
+test("config setter sends literal model/agent/effort and replaces full confirmed catalogs", async (t) => {
+  const backend = sessions(t, undefined, "config");
+  const record = await backend.create(__dirname);
+  const other = await backend.create(path.join(__dirname, "fixtures"));
+  const otherSnapshot = structuredClone(other.configOptions);
+  await backend.setConfigOption(record, "mode", "custom-agent", record.configRevision);
+  await backend.setConfigOption(record, "effort", "unusual-variant", record.configRevision);
+  await backend.setConfigOption(record, "effort", "default", record.configRevision);
+  await backend.setConfigOption(record, "model", "provider/test/reasoning/extra", record.configRevision);
+  assert.equal(record.configOptions[0].currentValue, "provider/test/reasoning/extra");
+  assert.equal(record.configOptions[2].currentValue, "removed-current");
+  assert.deepEqual(record.configOptions[2].options.map((item) => item.value), ["default", "deep-custom"]);
+  await backend.setConfigOption(record, "effort", "deep-custom", record.configRevision);
+  await backend.setConfigOption(record, "model", "provider/test/plain", record.configRevision);
+  assert.equal(record.configOptions.some((item) => item.id === "effort"), false);
+  assert.deepEqual(record.history, []);
+  assert.deepEqual(other.configOptions, otherSnapshot);
+  assert.deepEqual((await configTraffic(backend)).filter((entry) => entry.method === "session/set_config_option").map((entry) => entry.params.value), ["custom-agent", "unusual-variant", "default", "provider/test/reasoning/extra", "deep-custom", "provider/test/plain"]);
+});
+
+test("config setter rejects stale revision and absent membership without RPC", async (t) => {
+  const backend = sessions(t, undefined, "config");
+  const record = await backend.create(__dirname);
+  const stale = record.configRevision;
+  await backend.setConfigOption(record, "mode", "custom-agent", stale);
+  await assert.rejects(backend.setConfigOption(record, "mode", "workspace-agent", stale), /stale/i);
+  await assert.rejects(backend.setConfigOption(record, "mode", "made-up", record.configRevision), /unavailable/i);
+  await assert.rejects(backend.setConfigOption(record, "made-up", "default", record.configRevision), /unavailable/i);
+  assert.equal((await configTraffic(backend)).filter((entry) => entry.method === "session/set_config_option").length, 1);
+});
+
+test("config reserves change synchronously, Send waits and reserved/active prompts reject setters", { timeout: 3000 }, async (t) => {
+  let entered;
+  let releasePermission;
+  const opened = new Promise((resolve) => { entered = resolve; });
+  const permission = new Promise((resolve) => { releasePermission = resolve; });
+  const backend = sessions(t, () => { entered(); return permission; }, "config-delayed");
+  const record = await backend.create(__dirname);
+  const pending = configBarrier(t, backend.client);
+  const change = backend.setConfigOption(record, "mode", "custom-agent", record.configRevision);
+  const busy = assert.rejects(backend.setConfigOption(record, "effort", "default", record.configRevision), /busy/i);
+  await pending;
+  await busy;
+  const send = backend.prompt(record, "after config", new AbortController().signal, () => {});
+  await assert.rejects(backend.setConfigOption(record, "mode", "workspace-agent", record.configRevision), /prompt.*active/i);
+  assert.deepEqual(record.history, []);
+  assert.equal((await configTraffic(backend)).some((entry) => entry.method === "session/prompt"), false);
+  await backend.client.requestExtension("echo", { control: "release-config" });
+  await change;
+  await opened;
+  try {
+    await assert.rejects(backend.setConfigOption(record, "mode", "workspace-agent", record.configRevision), /prompt.*active/i);
+    assert.equal(record.configOptions[1].currentValue, "custom-agent");
+    assert.equal(record.history[0].text, "after config");
+  } finally {
+    releasePermission("no");
+    await send;
+  }
+  assert.equal(record.configPending, undefined);
+});
+
+for (const scenario of ["config-delayed-error", "config-delayed-malformed"]) {
+  test(`config ${scenario} prevents waiting Send and reloads uncertain attached state once`, { timeout: 3000 }, async (t) => {
+    const backend = sessions(t, undefined, scenario);
+    const record = await backend.create(__dirname);
+    const revision = record.configRevision;
+    const connection = record.connection;
+    const pending = configBarrier(t, connection);
+    const change = backend.setConfigOption(record, "mode", "custom-agent", revision);
+    const rejectedChange = assert.rejects(change, /configuration failed|configOptions/);
+    await pending;
+    const updates = [];
+    const send = backend.prompt(record, "must not send", new AbortController().signal, (update) => updates.push(update));
+    const rejectedSend = assert.rejects(send, /configuration failed|configOptions/);
+    await connection.requestExtension("echo", { control: "release-config" });
+    await Promise.all([rejectedChange, rejectedSend]);
+    assert.deepEqual(record.history, []);
+    assert.deepEqual(record.configOptions, []);
+    assert.equal(record.configValid, false);
+    assert.equal(record.configPending, undefined);
+    assert.equal(record.turn, undefined);
+    assert.deepEqual(updates, []);
+    const nextUpdates = [];
+    await backend.prompt(record, "recovered Send", new AbortController().signal, (update) => nextUpdates.push(update));
+    assert.equal(record.connection, connection, "Recovery must bypass same-connection fast path");
+    assert.equal(record.configValid, true);
+    assert.equal(record.configOptions[1].currentValue, "custom-agent", "No optimistic rollback after backend mutation");
+    assert.deepEqual(record.history.filter((turn) => turn.role === "user").map((turn) => turn.text), ["previous question", "recovered Send"]);
+    assert.equal(nextUpdates.some((update) => update.content?.text === "previous answer"), false);
+    const traffic = await configTraffic(backend);
+    assert.equal(traffic.filter((entry) => entry.method === "session/load").length, 1);
+    assert.equal(traffic.filter((entry) => entry.method === "session/prompt").length, 1);
+    assert.equal(traffic.filter((entry) => entry.method === "session/set_config_option").length, 1);
+  });
+}
+
+test("config Stop while waiting returns cancelled without cancel RPC or claiming config cancellation", { timeout: 3000 }, async (t) => {
+  const backend = sessions(t, undefined, "config-delayed");
+  const record = await backend.create(__dirname);
+  const pending = configBarrier(t, backend.client);
+  const change = backend.setConfigOption(record, "mode", "custom-agent", record.configRevision);
+  await pending;
+  const stop = new AbortController();
+  const send = backend.prompt(record, "cancelled before Send", stop.signal, () => {});
+  stop.abort();
+  assert.equal((await send).stopReason, "cancelled");
+  assert.ok(record.configPending, "Already sent config remains pending after Stop");
+  assert.equal(record.turn, undefined);
+  assert.equal(getEventListeners(stop.signal, "abort").length, 0);
+  assert.deepEqual(record.history, []);
+  assert.equal((await configTraffic(backend)).some((entry) => ["session/cancel", "session/prompt"].includes(entry.method)), false);
+  await backend.client.requestExtension("echo", { control: "release-config" });
+  await change;
+  assert.equal(record.configOptions[1].currentValue, "custom-agent");
+});
+
+test("config reconnect replaces selections, rejects pre-load revision and ignores old connection notifications", async (t) => {
+  const backend = sessions(t, undefined, "config");
+  const record = await backend.create(__dirname);
+  await backend.setConfigOption(record, "mode", "custom-agent", record.configRevision);
+  const old = backend.client;
+  const revision = record.configRevision;
+  const closed = new Promise((resolve) => old.child.once("close", resolve));
+  old.dispose();
+  await closed;
+  await assert.rejects(backend.setConfigOption(record, "mode", "workspace-agent", revision), /stale/i);
+  assert.equal(record.configOptions[1].currentValue, "workspace-agent");
+  const currentRevision = record.configRevision;
+  old.emit("notification", "session/update", { sessionId: record.id, update: { sessionUpdate: "config_option_update", configOptions: [] } });
+  old.emit("notification", "session/update", { sessionId: record.id, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "obsolete" } } });
+  assert.equal(record.configRevision, currentRevision);
+  assert.equal(record.history[1].updates.length, 1);
+  assert.equal((await configTraffic(backend)).some((entry) => entry.method === "session/set_config_option"), false);
+});
+
+test("config raw wire updates reject malformed optional fields and accept grouped membership", async (t) => {
+  const backend = sessions(t, undefined, "config");
+  const record = await backend.create(__dirname);
+  const original = structuredClone(record.configOptions);
+  const revision = record.configRevision;
+  for (const bad of [{ ...original[0], description: 42 }, { ...original[0], category: false }, { ...original[0], options: [{ value: "one", name: "One", description: {} }] }]) {
+    await backend.client.requestExtension("echo", { control: "update-config", sessionId: record.id, configOptions: [bad] });
+    assert.deepEqual(record.configOptions, original);
+    assert.equal(record.configRevision, revision);
+  }
+  const grouped = [{ ...original[1], options: [{ group: "agents", name: "Agents", options: original[1].options }] }];
+  await backend.client.requestExtension("echo", { control: "update-config", sessionId: record.id, configOptions: grouped });
+  assert.deepEqual(record.configOptions, grouped);
+  await backend.setConfigOption(record, "mode", "custom-agent", record.configRevision);
+  assert.equal(record.configOptions[1].currentValue, "custom-agent");
+});
+
+test("config mixed wire catalog rejects all entries atomically then accepts a valid full replacement", async (t) => {
+  const backend = sessions(t, undefined, "config");
+  const record = await backend.create(__dirname);
+  const original = structuredClone(record.configOptions);
+  const revision = record.configRevision;
+  const events = [];
+  backend.on("config", (changed) => events.push(changed));
+  const replacement = [
+    { id: "model", name: "Model", type: "select", currentValue: "provider/test/plain", options: [{ value: "provider/test/plain", name: "Plain model" }] },
+    { id: "mode", name: "Agent", type: "select", category: "mode", description: "Confirmed agent", currentValue: "custom-agent", options: [{ value: "custom-agent", name: "Custom agent" }] },
+  ];
+  for (const malformed of [{ description: 42 }, { category: false }]) {
+    await backend.client.requestExtension("echo", { control: "update-config", sessionId: record.id, configOptions: [replacement[0], { ...replacement[1], ...malformed }] });
+    assert.deepEqual(record.configOptions, original);
+    assert.equal(record.configRevision, revision);
+    assert.deepEqual(events, []);
+  }
+  await backend.client.requestExtension("echo", { control: "update-config", sessionId: record.id, configOptions: replacement });
+  assert.deepEqual(record.configOptions, replacement);
+  assert.equal(record.configOptions[0].currentValue, "provider/test/plain");
+  assert.equal(record.configOptions[1].currentValue, "custom-agent");
+  assert.equal(record.configRevision, revision + 1);
+  assert.deepEqual(events, [record]);
+  assert.deepEqual(record.history, []);
+});
+
+for (const result of [null, {}, { configOptions: null }, { configOptions: {} }, { configOptions: [{ id: "model", name: "Model", type: "select", currentValue: "current", options: [{ value: "one", name: "One", description: 42 }] }] }]) {
+  test(`config set requires full valid options for ${JSON.stringify(result)}`, async (t) => {
+    const backend = sessions(t, undefined, "config");
+    const record = await backend.create(__dirname);
+    await backend.client.requestExtension("echo", { control: "next-config-response", result });
+    await assert.rejects(backend.setConfigOption(record, "mode", "custom-agent", record.configRevision), /configOptions/);
+    assert.equal(record.configValid, false);
+    assert.deepEqual(record.configOptions, []);
+    const invalidRevision = record.configRevision;
+    await assert.rejects(backend.setConfigOption(record, "mode", "workspace-agent", invalidRevision), /stale/i);
+    assert.equal(record.configValid, true);
+    assert.equal(record.configOptions[1].currentValue, "custom-agent");
+    assert.equal((await configTraffic(backend)).filter((entry) => entry.method === "session/set_config_option").length, 1);
+  });
+}
+
+test("config valid empty set response clears catalog instead of retaining old selections", async (t) => {
+  const backend = sessions(t, undefined, "config");
+  const record = await backend.create(__dirname);
+  await backend.client.requestExtension("echo", { control: "next-config-response", result: { configOptions: [] } });
+  await backend.setConfigOption(record, "mode", "custom-agent", record.configRevision);
+  assert.deepEqual(record.configOptions, []);
+  assert.equal(record.configValid, true);
+});
+
+test("config shared deadline closes pending change and another session prompt without loosening timeout", { timeout: 3000 }, async (t) => {
+  const deadlines = new Map();
+  const schedule = global.setTimeout;
+  const clear = global.clearTimeout;
+  t.mock.method(global, "setTimeout", (callback, delay, ...args) => {
+    const timer = schedule(callback, delay, ...args);
+    if (delay === 30000) deadlines.set(timer, callback);
+    return timer;
+  });
+  t.mock.method(global, "clearTimeout", (timer) => { deadlines.delete(timer); clear(timer); });
+  let entered;
+  const opened = new Promise((resolve) => { entered = resolve; });
+  const backend = sessions(t, async (params, signal) => {
+    entered();
+    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+    return undefined;
+  }, "config-delayed");
+  const first = await backend.create(__dirname);
+  const second = await backend.create(path.join(__dirname, "fixtures"));
+  const pending = configBarrier(t, backend.client);
+  const change = backend.setConfigOption(first, "mode", "custom-agent", first.configRevision);
+  const rejectedChange = assert.rejects(change, /session\/set_config_option.*timed out after 30000ms/);
+  await pending;
+  assert.equal(deadlines.size, 1);
+  const expire = [...deadlines.values()][0];
+  const waiting = backend.prompt(first, "waiting", new AbortController().signal, () => {});
+  const rejectedWaiting = assert.rejects(waiting, /timed out after 30000ms/);
+  const other = backend.prompt(second, "active", new AbortController().signal, () => {});
+  const rejectedOther = assert.rejects(other, /timed out after 30000ms/);
+  await opened;
+  expire();
+  await Promise.all([rejectedChange, rejectedWaiting, rejectedOther]);
+  assert.equal(backend.client, undefined);
+  assert.equal(first.configPending, undefined);
+  assert.equal(first.turn, undefined);
+  assert.equal(second.turn, undefined);
+  assert.equal(first.configValid, false);
+  assert.equal(second.configValid, false);
+  assert.deepEqual(first.history, []);
+  assert.equal(deadlines.size, 0);
+});
+
+test("config recovery rebuilds replay history once without streaming old tools or opening replay permission UI", async (t) => {
+  let permissionCalls = 0;
+  const backend = sessions(t, () => { permissionCalls++; return "yes"; }, "config-recovery-replay");
+  const record = await backend.create(__dirname);
+  await backend.client.requestExtension("echo", { control: "next-config-response", result: {} });
+  await assert.rejects(backend.setConfigOption(record, "mode", "custom-agent", record.configRevision), /configOptions/);
+  const updates = [];
+  await backend.prompt(record, "fresh prompt", new AbortController().signal, (update) => updates.push(update));
+  assert.equal(permissionCalls, 1, "Only the new prompt can request permission");
+  assert.equal(record.history[1].updates.filter((update) => update.toolCallId === "replayed-tool").length, 1);
+  assert.equal(updates.some((update) => update.toolCallId === "replayed-tool" || update.content?.text === "previous answer"), false);
+  const stats = await backend.client.requestExtension("echo", { control: "stats" });
+  assert.deepEqual(stats.replayPermission, { outcome: { outcome: "cancelled" } });
+  await backend.prompt(record, "second prompt", new AbortController().signal, () => {});
+  assert.equal(record.history[1].updates.filter((update) => update.toolCallId === "replayed-tool").length, 1);
+  assert.equal((await configTraffic(backend)).filter((entry) => entry.method === "session/load").length, 1);
+});
+
 test("creates a session, streams output and retains conversation", async (t) => {
   const backend = sessions(t);
   const record = await backend.create(__dirname);

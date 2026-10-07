@@ -36,7 +36,9 @@ function matchesSchema(value, schema) {
 function assertProtocolPayload(value, name) {
   const schema = protocolSchemas[name];
   assert.ok(matchesSchema(value, schema), `${name} must match the official SDK wire schema before normalization`);
-  assert.ok(Object.keys(value).every((key) => Object.hasOwn(schema.properties, key)), `${name}: test-only fields belong in _meta`);
+  const variants = (schema.anyOf ?? []).filter((part) => matchesSchema(value, part));
+  assert.ok(Object.keys(value).every((key) => Object.hasOwn(schema.properties, key) ||
+    variants.some((part) => Object.hasOwn(part.properties ?? {}, key))), `${name}: test-only fields belong in _meta`);
 }
 
 function client(t, options = {}) {
@@ -202,6 +204,39 @@ test("independent fixture tool-content replay matches public SDK 1.7 schemas", a
     ["Annotations", { audience: ["system"] }],
     ["Annotations", { priority: "high" }],
     ["Annotations", { _meta: [] }],
+  ]) assert.equal(matchesSchema(value, protocolSchemas[name]), false);
+});
+
+test("independent fixture config new/load/set/update traffic matches public SDK 1.7 schemas", async (t) => {
+  const connection = new AcpClient(process.execPath, [path.join(__dirname, "fixtures/agent.cjs"), "config"], { cwd: __dirname });
+  t.after(() => connection.dispose());
+  const updates = [];
+  const sent = [];
+  const write = connection.child.stdin.write;
+  t.mock.method(connection.child.stdin, "write", function (bytes, ...args) {
+    sent.push(JSON.parse(Buffer.from(bytes).toString()));
+    return write.call(this, bytes, ...args);
+  });
+  connection.on("notification", (method, params) => {
+    assert.equal(method, "session/update");
+    assertProtocolPayload(params, "SessionNotification");
+    updates.push(params.update);
+  });
+  await connection.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+  const created = await connection.request("session/new", { cwd: __dirname, mcpServers: [] });
+  assertProtocolPayload(created, "NewSessionResponse");
+  const loaded = await connection.request("session/load", { sessionId: created.sessionId, cwd: __dirname, mcpServers: [] });
+  assertProtocolPayload(loaded, "LoadSessionResponse");
+  const changed = await connection.request("session/set_config_option", { sessionId: created.sessionId, configId: "model", value: "provider/test/reasoning/extra" });
+  assertProtocolPayload(changed, "SetSessionConfigOptionResponse");
+  assertProtocolPayload(sent.find((message) => message.method === "session/set_config_option").params, "SetSessionConfigOptionRequest");
+  assert.equal(created.configOptions[2].currentValue, "default");
+  assert.equal(changed.configOptions[2].currentValue, "removed-current");
+  assert.deepEqual(updates.at(-1), { sessionUpdate: "config_option_update", configOptions: changed.configOptions });
+  for (const [name, value] of [
+    ["SetSessionConfigOptionResponse", {}],
+    ["SessionConfigOption", { id: "model", name: "Model", type: "select", currentValue: "one", options: [{ value: "one", name: "One", description: 42 }] }],
+    ["SessionNotification", { sessionId: "s", update: { sessionUpdate: "config_option_update", configOptions: null } }],
   ]) assert.equal(matchesSchema(value, protocolSchemas[name]), false);
 });
 

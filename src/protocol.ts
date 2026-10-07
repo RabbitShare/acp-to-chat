@@ -1,4 +1,83 @@
-import type { RequestPermissionRequest, PermissionOption, SessionNotification, SessionUpdate, ContentBlock, Annotations, Role, ToolCallContent, ToolCallUpdate, ToolKind, ToolCallStatus } from "@agentclientprotocol/sdk";
+import type { AvailableCommand, RequestPermissionRequest, PermissionOption, SessionNotification, SessionUpdate, ContentBlock, Annotations, Role, ToolCallContent, ToolCallUpdate, ToolKind, ToolCallStatus, SessionConfigOption, SessionConfigSelectOption, SessionConfigSelectGroup } from "@agentclientprotocol/sdk";
+
+export type SelectConfigOption = Extract<SessionConfigOption, { type: "select" }>;
+
+export function readAvailableCommands(value: unknown): AvailableCommand[] | undefined {
+  // Native completion builds sort strings proportional to the item index.
+  // Bound metadata before publication, not only at the transport byte limit.
+  if (!Array.isArray(value) || value.length > 512) return;
+  const commands: AvailableCommand[] = [];
+  const names = new Set<string>();
+  for (const item of value) {
+    if (!isObject(item) || !isNonemptyString(item.name) || item.name.length > 256 ||
+        typeof item.description !== "string" || item.description.length > 8192 || names.has(item.name)) return;
+    let input: AvailableCommand["input"];
+    if (item.input === null) input = null;
+    else if (item.input !== undefined) {
+      if (!isObject(item.input) || typeof item.input.hint !== "string" || item.input.hint.length > 2048) return;
+      input = { hint: item.input.hint };
+    }
+    names.add(item.name);
+    commands.push({ name: item.name, description: item.description, ...(input !== undefined ? { input } : {}) });
+  }
+  return Buffer.byteLength(JSON.stringify(commands)) <= 256 * 1024 ? commands : undefined;
+}
+
+function isNonemptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function hasOptionalString(value: Record<string, unknown>, key: string): boolean {
+  return value[key] === undefined || value[key] === null || typeof value[key] === "string";
+}
+
+function readConfigValues(value: unknown, ids: Set<string>): SessionConfigSelectOption[] | undefined {
+  if (!Array.isArray(value)) return;
+  const options: SessionConfigSelectOption[] = [];
+  for (const item of value) {
+    if (!isObject(item) || !isNonemptyString(item.value) || !isNonemptyString(item.name) ||
+        "group" in item || "options" in item || !hasOptionalString(item, "description") || ids.has(item.value)) return;
+    ids.add(item.value);
+    options.push({ value: item.value, name: item.name,
+      ...(item.description !== undefined ? { description: readOptionalString(item, "description") } : {}) });
+  }
+  return options;
+}
+
+// Project only consumed fields from the raw catalog, before SDK optional salvage.
+export function readConfigOptions(value: unknown, optional = false): SelectConfigOption[] | undefined {
+  if (optional && value == null) return [];
+  if (!Array.isArray(value)) return;
+  const result: SelectConfigOption[] = [];
+  const configIds = new Set<string>();
+  for (const item of value) {
+    if (!isObject(item) || !isNonemptyString(item.id) || !isNonemptyString(item.name) ||
+        !hasOptionalString(item, "description") || !hasOptionalString(item, "category") || configIds.has(item.id)) return;
+    configIds.add(item.id);
+    if (item.type === "boolean" && typeof item.currentValue === "boolean") continue;
+    if (item.type !== "select" || !isNonemptyString(item.currentValue) || !Array.isArray(item.options)) return;
+    const valueIds = new Set<string>();
+    let options: SessionConfigSelectOption[] | SessionConfigSelectGroup[] | undefined;
+    if (item.options.some((option) => isObject(option) && "group" in option)) {
+      const groups: SessionConfigSelectGroup[] = [];
+      const groupIds = new Set<string>();
+      for (const group of item.options) {
+        if (!isObject(group) || !isNonemptyString(group.group) || !isNonemptyString(group.name) ||
+            "value" in group || groupIds.has(group.group)) return;
+        groupIds.add(group.group);
+        const values = readConfigValues(group.options, valueIds);
+        if (!values) return;
+        groups.push({ group: group.group, name: group.name, options: values });
+      }
+      options = groups;
+    } else options = readConfigValues(item.options, valueIds);
+    if (!options) return;
+    result.push({ id: item.id, name: item.name, type: "select", currentValue: item.currentValue, options,
+      ...(item.description !== undefined ? { description: readOptionalString(item, "description") } : {}),
+      ...(item.category !== undefined ? { category: readOptionalString(item, "category") } : {}) });
+  }
+  return result;
+}
 
 export function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

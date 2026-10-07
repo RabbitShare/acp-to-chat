@@ -5,14 +5,32 @@
   "version": "0.0.1",
   "publisher": "local",
   "private": true,
-  "engines": { "vscode": "^1.140.0" },
+  "engines": {
+    "vscode": "^1.140.0"
+  },
   "main": "./dist/main.js",
-  "extensionKind": ["workspace"],
-  "enabledApiProposals": ["chatSessionsProvider", "chatParticipantPrivate", "chatParticipantAdditions", "chatProvider"],
-  "activationEvents": ["onChatSession:opencode", "onChatParticipant:opencode", "onCommand:opencode.newSession"],
+  "extensionKind": [
+    "workspace"
+  ],
+  "enabledApiProposals": [
+    "chatSessionsProvider",
+    "chatParticipantPrivate",
+    "chatParticipantAdditions",
+    "chatProvider",
+    "chatSessionCustomizationProvider"
+  ],
+  "activationEvents": [
+    "onChatSession:opencode",
+    "onChatParticipant:opencode",
+    "onCommand:opencode.newSession"
+  ],
   "capabilities": {
-    "untrustedWorkspaces": { "supported": false },
-    "virtualWorkspaces": { "supported": false }
+    "untrustedWorkspaces": {
+      "supported": false
+    },
+    "virtualWorkspaces": {
+      "supported": false
+    }
   },
   "scripts": {
     "build": "node scripts/build.mjs",
@@ -23,23 +41,47 @@
     "check": "node scripts/check.cjs"
   },
   "contributes": {
-    "commands": [{ "command": "opencode.newSession", "title": "OpenCode: New Native Chat Session" }],
-    "languageModelChatProviders": [{ "vendor": "opencode", "displayName": "OpenCode" }],
-    "chatSessions": [{
-      "type": "opencode",
-      "name": "opencode",
-      "displayName": "OpenCode",
-      "description": "Run OpenCode through ACP in native chat",
-      "canDelegate": true,
-      "requiresCopilotSignIn": false,
-      "requiresCustomModels": true,
-      "supportsAutoModel": false,
-      "capabilities": {},
-      "welcomeTitle": "OpenCode",
-      "welcomeMessage": "Uses your existing OpenCode configuration and credentials. Tools run with OpenCode's permissions.",
-      "inputPlaceholder": "Ask OpenCode about this project",
-      "when": "isWorkspaceTrusted && workspaceFolderCount > 0"
-    }],
+    "commands": [
+      {
+        "command": "opencode.newSession",
+        "title": "OpenCode: New Native Chat Session",
+        "icon": "$(plus)"
+      }
+    ],
+    "menus": {
+      "chat/newSession": [
+        {
+          "command": "opencode.newSession",
+          "when": "isWorkspaceTrusted && workspaceFolderCount > 0 && chatSessionType == opencode",
+          "group": "1_open@0"
+        }
+      ]
+    },
+    "languageModelChatProviders": [
+      {
+        "vendor": "opencode",
+        "displayName": "OpenCode"
+      }
+    ],
+    "chatSessions": [
+      {
+        "type": "opencode",
+        "name": "opencode",
+        "displayName": "OpenCode",
+        "description": "Run OpenCode through ACP in native chat",
+        "canDelegate": true,
+        "requiresCopilotSignIn": false,
+        "requiresCustomModels": true,
+        "supportsAutoModel": false,
+        "capabilities": {
+          "supportsPromptAttachments": true
+        },
+        "welcomeTitle": "OpenCode",
+        "welcomeMessage": "Uses your existing OpenCode configuration and credentials. Tools run with OpenCode's permissions.",
+        "inputPlaceholder": "Ask OpenCode about this project",
+        "when": "isWorkspaceTrusted && workspaceFolderCount > 0"
+      }
+    ],
     "configuration": {
       "title": "OpenCode Native Chat",
       "properties": {
@@ -48,6 +90,13 @@
           "default": "opencode",
           "scope": "machine",
           "description": "OpenCode executable. Use an absolute path if VS Code cannot find it. No shell syntax."
+        },
+        "opencodeNativeChat.commandTemplateDirectories": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": [],
+          "scope": "resource",
+          "description": "Fallback directories containing Markdown command templates. Relative paths use the session cwd. Does not add slash completions; commands must be advertised by ACP. Ambiguous matches are rejected."
         }
       }
     }
@@ -59,6 +108,8 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.7.0",
+    "jsonc-parser": "3.3.1",
+    "yaml": "2.9.1",
     "zod": "3.25.76"
   }
 }

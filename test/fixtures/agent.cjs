@@ -17,6 +17,41 @@ const send = (message, splitUtf8 = false) => {
 const pending = new Map();
 const permissions = new Map();
 const workingDirectories = new Map();
+const configurations = new Map();
+const traffic = [];
+const templateHistory = new Map();
+let heldConfig;
+let nextConfigResponse;
+let replayPermission;
+function catalog(cwd) {
+  const suffix = require("node:path").basename(cwd);
+  return [
+    { id: "model", name: "Model", type: "select", category: "model", currentValue: `provider/${suffix}/initial`, options: [
+      { value: `provider/${suffix}/initial`, name: "Initial" },
+      { value: `provider/${suffix}/reasoning/extra`, name: "Reasoning model" },
+      { value: `provider/${suffix}/plain`, name: "Plain model" },
+    ] },
+    { id: "mode", name: "Agent", type: "select", category: "mode", currentValue: "workspace-agent", options: [
+      { value: "workspace-agent", name: "Workspace agent" }, { value: "custom-agent", name: "Custom agent" },
+    ] },
+    { id: "effort", name: "Reasoning", type: "select", category: "thought_level", currentValue: "default", options: [
+      { value: "default", name: "Default" }, { value: "unusual-variant", name: "Unusual" },
+    ] },
+  ];
+}
+function configResult(options, phase) {
+  if (!scenario?.startsWith("config")) return {};
+  if (scenario === "config-null") return { configOptions: null };
+  if (scenario === `config-malformed-${phase}`) return { configOptions: [{ ...options[0], category: 42 }] };
+  return { configOptions: options };
+}
+function commandCatalog(cwd) {
+  return [{ name: "compact", description: "Compact the session" },
+    { name: `review-${require("node:path").basename(cwd)}`, description: "Review project", input: { hint: "files to review" } }];
+}
+function commandUpdate(sessionId, availableCommands) {
+  send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "available_commands_update", availableCommands } } });
+}
 let sessionCount = 0;
 let firstEcho;
 let callbackRequestId;
@@ -28,6 +63,7 @@ if (scenario === "stubborn") {
 
 lines.on("line", (line) => {
   const message = JSON.parse(line);
+  if (message.method) traffic.push({ method: message.method, params: message.params });
 
   if (message.method === "initialize") {
     if (scenario === "initialize-null" || scenario === "initialize-invalid") {
@@ -40,6 +76,31 @@ lines.on("line", (line) => {
     }
     send({ id: message.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
   } else if (message.method === "echo") {
+    if (message.params.control === "update-commands") {
+      commandUpdate(message.params.sessionId, message.params.availableCommands);
+      send({ id: message.id, result: {} });
+      return;
+    }
+    if (message.params.control === "next-config-response") {
+      nextConfigResponse = message.params.result;
+      send({ id: message.id, result: {} });
+      return;
+    }
+    if (message.params.control === "update-config") {
+      send({ method: "session/update", params: { sessionId: message.params.sessionId, update: { sessionUpdate: "config_option_update", configOptions: message.params.configOptions } } });
+      send({ id: message.id, result: {} });
+      return;
+    }
+    if (message.params.control === "stats") {
+      send({ id: message.id, result: { traffic, replayPermission } });
+      return;
+    }
+    if (message.params.control === "release-config") {
+      heldConfig?.();
+      heldConfig = undefined;
+      send({ id: message.id, result: {} });
+      return;
+    }
     const reply = { id: message.id, result: { text: "Hello 🌍", params: message.params } };
     if (message.params.n === 1) firstEcho = reply;
     else if (message.params.n === 2) {
@@ -65,6 +126,8 @@ lines.on("line", (line) => {
     send({ id: "callback-1", method: "client/callback", params: {} });
   } else if (message.id === "callback-1") {
     send({ id: callbackRequestId, result: message });
+  } else if (message.id === "replay-permission") {
+    replayPermission = message.result;
   } else if (message.method === "session/new") {
     if (typeof message.params.cwd !== "string" || !require("node:path").isAbsolute(message.params.cwd)) {
       send({ id: message.id, error: { code: -32602, message: "cwd must be absolute" } });
@@ -76,20 +139,83 @@ lines.on("line", (line) => {
     }
     const sessionId = `session-${++sessionCount}`;
     workingDirectories.set(sessionId, message.params.cwd);
-    send({ id: message.id, result: { sessionId } });
+    const options = catalog(message.params.cwd);
+    configurations.set(sessionId, options);
+    if (scenario === "commands-buffer-limit") {
+      const commands = Array.from({ length: 120 }, (_, index) => ({ name: String(index), description: "x".repeat(2048) }));
+      for (let index = 0; index < 4; index++) commandUpdate(`unknown-${index}`, commands);
+      commandUpdate(sessionId, commands);
+    } else if (scenario?.startsWith("commands") && scenario !== "commands-after-new") commandUpdate(sessionId, commandCatalog(message.params.cwd));
+    send({ id: message.id, result: { sessionId, ...configResult(options, "new") } });
+    if (scenario === "commands-after-new") commandUpdate(sessionId, commandCatalog(message.params.cwd));
     if (scenario === "crash-idle") setTimeout(() => process.exit(7), 100);
   } else if (message.method === "session/load") {
+    workingDirectories.set(message.params.sessionId, message.params.cwd);
+    const options = configurations.get(message.params.sessionId) ?? catalog(message.params.cwd);
+    configurations.set(message.params.sessionId, options);
+    if (scenario?.startsWith("commands") && scenario !== "commands-no-load") commandUpdate(message.params.sessionId, commandCatalog(message.params.cwd));
+    if (scenario === "commands-load-error") {
+      send({ id: message.id, error: { code: -32000, message: "load failed after commands" } });
+      return;
+    }
+    if (scenario === "commands-template-replay") {
+      for (const text of templateHistory.get(message.params.sessionId) ?? []) {
+        send({ method: "session/update", params: { sessionId: message.params.sessionId, update: { sessionUpdate: "user_message_chunk", content: { type: "text", text } } } });
+        send({ method: "session/update", params: { sessionId: message.params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `answer:${text}` } } } });
+      }
+      send({ id: message.id, result: configResult(options, "load") });
+      return;
+    }
     send({ method: "session/update", params: { sessionId: message.params.sessionId, update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "previous question" } } } });
     send({ method: "session/update", params: { sessionId: message.params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "previous answer" } } } });
+    if (scenario === "config-recovery-replay") {
+      send({ method: "session/update", params: { sessionId: message.params.sessionId, update: { sessionUpdate: "tool_call", toolCallId: "replayed-tool", title: "Replayed tool", status: "completed" } } });
+      send({ id: "replay-permission", method: "session/request_permission", params: { sessionId: message.params.sessionId, toolCall: { toolCallId: "replayed-tool", title: "Never execute during replay" }, options: [{ optionId: "yes", name: "Allow", kind: "allow_once" }] } });
+    }
     if (scenario === "tool-content-replay") send({ method: "session/update", params: { sessionId: message.params.sessionId, update: {
       sessionUpdate: "tool_call", toolCallId: "replayed-tool", title: "Validation", status: "completed", content: [
         { type: "content", _meta: { wrapper: "replayed" }, content: { type: "image", data: "replayed-image", mimeType: "image/png", uri: "file:///replayed-image", annotations: { audience: ["user"], priority: 0.75 }, _meta: { source: "history" } } },
         { type: "content", content: { type: "resource_link", uri: "file:///report", name: "report", title: "Validation result", description: "2 tests failed", mimeType: "text/plain", size: 10, annotations: null, _meta: null } },
       ],
     } } });
-    send({ id: message.id, result: {} });
+    send({ id: message.id, result: configResult(options, "load") });
+  } else if (message.method === "session/set_config_option") {
+    const { sessionId, configId, value } = message.params;
+    let options = configurations.get(sessionId);
+    const selected = options?.find((option) => option.id === configId);
+    if (!selected || !selected.options.some((option) => option.value === value)) {
+      send({ id: message.id, error: { code: -32602, message: "invalid configuration selection" } });
+      return;
+    }
+    selected.currentValue = value;
+    if (configId === "model") {
+      options = options.filter((option) => option.id !== "effort");
+      if (value.includes("/reasoning/")) options.push({ id: "effort", name: "Reasoning", type: "select", currentValue: "removed-current", options: [{ value: "default", name: "Default" }, { value: "deep-custom", name: "Deep" }] });
+      configurations.set(sessionId, options);
+    }
+    const reply = () => {
+      if (nextConfigResponse !== undefined) {
+        send({ id: message.id, result: nextConfigResponse });
+        nextConfigResponse = undefined;
+      }
+      else if (scenario === "config-delayed-error") send({ id: message.id, error: { code: -32000, message: "configuration failed after mutation" } });
+      else if (scenario === "config-delayed-malformed") send({ id: message.id, result: { configOptions: [{ ...options[0], description: 42 }] } });
+      else {
+        send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "config_option_update", configOptions: options } } });
+        send({ id: message.id, result: { configOptions: options } });
+      }
+    };
+    if (scenario?.startsWith("config-delayed")) {
+      heldConfig = reply;
+      send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "session_info_update", title: "Configuration pending" }, _meta: { fixture: "config_pending" } } });
+    } else reply();
   } else if (message.method === "session/prompt") {
     const sessionId = message.params.sessionId;
+    if (scenario === "commands-template-replay") {
+      const history = templateHistory.get(sessionId) ?? [];
+      history.push(message.params.prompt[0].text);
+      templateHistory.set(sessionId, history);
+    }
     if (message.params.prompt[0].text === "__fail__") {
       send({ id: message.id, error: { code: -32000, message: "prompt failed" } });
       return;

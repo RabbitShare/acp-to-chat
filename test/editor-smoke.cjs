@@ -31,10 +31,11 @@ async function run(vscode = require("vscode")) {
   assert.equal(controller.id, "opencode");
   const commands = await vscode.commands.getCommands(true);
   assert.ok(commands.includes("workbench.action.chat.openNewChatSessionInPlace.opencode"), "Native OpenCode session command was not registered");
-  await vscode.commands.executeCommand("opencode.newSession");
+  // Product New eagerly creates an ACP session; smoke opens only the lazy native draft.
+  await vscode.commands.executeCommand("workbench.action.chat.openNewChatSessionInPlace.opencode", "sidebar");
   // VS Code 1.140.0 exposes only Local sessions through activeChatPanelSessionResource.
   // Confirm external-session rendering separately in the renderer log, not via that getter.
-  console.log("OpenCode native API activation and open command passed (verify renderer session separately; no model prompt or ACP process started)");
+  console.log("OpenCode native API activation and lazy draft open command passed (verify renderer session separately; no model prompt or ACP process started)");
 }
 
 module.exports = { run, waitForWorkspaceTrust };

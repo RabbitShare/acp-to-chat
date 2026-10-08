@@ -3,7 +3,7 @@
   "displayName": "OpenCode Native Chat",
   "description": "OpenCode ACP sessions in the native VS Code chat. Experimental proposed API integration.",
   "version": "0.0.1",
-  "publisher": "206d4e24-9f6e-61e2-96d1-0bc8faac51e7",
+  "publisher": "RabbitShare",
   "repository": "https://github.com/RabbitShare/acp-to-chat",
   "private": true,
   "engines": {

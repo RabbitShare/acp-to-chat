@@ -1,0 +1,11 @@
+.git
+.gitignore
+.vscode/**
+node_modules/**
+test/**
+src/**
+tsconfig.json
+AGENTS.md
+docs/**
+scripts/**
+types/**

@@ -3,7 +3,8 @@
   "displayName": "OpenCode Native Chat",
   "description": "OpenCode ACP sessions in the native VS Code chat. Experimental proposed API integration.",
   "version": "0.0.1",
-  "publisher": "local",
+  "publisher": "206d4e24-9f6e-61e2-96d1-0bc8faac51e7",
+  "repository": "https://github.com/RabbitShare/acp-to-chat",
   "private": true,
   "engines": {
     "vscode": "^1.140.0"
@@ -93,7 +94,10 @@
         },
         "opencodeNativeChat.commandTemplateDirectories": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1 },
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
           "default": [],
           "scope": "resource",
           "description": "Fallback directories containing Markdown command templates. Relative paths use the session cwd. Does not add slash completions; commands must be advertised by ACP. Ambiguous matches are rejected."

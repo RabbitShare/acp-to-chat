@@ -11,6 +11,7 @@ import { errorMessage, isObject } from "./protocol";
 
 interface ClientOptions {
   cwd?: string;
+  env?: Record<string, string>;
   onRequest?: (method: string, params: unknown) => RequestPermissionResponse | Promise<RequestPermissionResponse>;
   onLog?: (text: string) => void;
 }
@@ -21,14 +22,20 @@ type FixtureMethod = "echo" | "fail" | "exit" | "invalid" | "invalid-request-id"
 
 export class AcpClient extends EventEmitter<{ notification: [method: string, params: unknown]; failure: [error: Error] }> {
   child: ChildProcessWithoutNullStreams;
+  readonly environment: NodeJS.ProcessEnv;
   private connection: ClientConnection;
   failure?: Error;
   disposing = false;
   capabilities: { loadSession?: boolean } = {};
 
-  constructor(command: string, args: string[], { cwd, onRequest, onLog = () => {} }: ClientOptions) {
+  constructor(command: string, args: string[], { cwd, env, onRequest, onLog = () => {} }: ClientOptions) {
     super();
-    this.child = spawn(command, args, { cwd, shell: false, stdio: ["pipe", "pipe", "pipe"] });
+    if (env !== undefined && (!isObject(env) || Object.entries(env).some(([key, value]) =>
+      !key || /[=\0]/.test(key) || typeof value !== "string" || value.includes("\0")))) {
+      throw new Error("[AcpClient.spawn] Invalid launch environment: expected variable names and string values without NUL");
+    }
+    this.environment = { ...process.env, ...env };
+    this.child = spawn(command, args, { cwd, env: this.environment, shell: false, stdio: ["pipe", "pipe", "pipe"] });
     this.child.stderr.on("data", (chunk: Buffer) => onLog(chunk.toString()));
     this.child.stdin.on("error", (error) => this.fail(new Error(`[AcpClient.write] ${error.message}`)));
     this.child.stdout.on("error", (error) => this.fail(new Error(`[AcpClient.receive] ${error.message}`)));

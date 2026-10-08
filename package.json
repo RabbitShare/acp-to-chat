@@ -2,7 +2,7 @@
   "name": "opencode-native-chat",
   "displayName": "OpenCode Native Chat",
   "description": "OpenCode ACP sessions in the native VS Code chat. Experimental proposed API integration.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "RabbitShare",
   "repository": "https://github.com/RabbitShare/acp-to-chat",
   "private": true,
@@ -91,6 +91,15 @@
           "default": "opencode",
           "scope": "machine",
           "description": "OpenCode executable. Use an absolute path if VS Code cannot find it. No shell syntax."
+        },
+        "opencodeNativeChat.env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "scope": "machine",
+          "markdownDescription": "Environment variables for the OpenCode child process, merged over VS Code's inherited environment. Values are literal strings, not shell expressions. Run **Developer: Reload Window** after changes. Setting `NODE_TLS_REJECT_UNAUTHORIZED` to `0` disables TLS certificate validation and makes HTTPS insecure; use only as an explicit temporary workaround."
         },
         "opencodeNativeChat.commandTemplateDirectories": {
           "type": "array",

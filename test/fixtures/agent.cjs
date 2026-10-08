@@ -76,6 +76,11 @@ lines.on("line", (line) => {
     }
     send({ id: message.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
   } else if (message.method === "echo") {
+    if (message.params.control === "environment") {
+      const environment = Object.fromEntries(message.params.keys.map((key) => [key, process.env[key] ?? null]));
+      send({ id: message.id, result: environment });
+      return;
+    }
     if (message.params.control === "update-commands") {
       commandUpdate(message.params.sessionId, message.params.availableCommands);
       send({ id: message.id, result: {} });

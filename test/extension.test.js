@@ -232,6 +232,21 @@ test("local slash Send streams expanded text and preserves original native histo
   assert.deepEqual((await traffic(editor.backend, "session/prompt")).map((entry) => entry.params.prompt[0].text), ["Answer briefly:\nquestion", "next"]);
 });
 
+test("local slash uses the launched ACP environment snapshot instead of parent or later overrides", async (t) => {
+  const previous = process.env.OPENCODE_CONFIG_CONTENT;
+  t.after(() => {
+    if (previous === undefined) delete process.env.OPENCODE_CONFIG_CONTENT;
+    else process.env.OPENCODE_CONFIG_CONTENT = previous;
+  });
+  process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ commands: { compact: { template: "Parent $ARGUMENTS" } } });
+  const editor = configured(t, "commands");
+  editor.backend.options.env = { OPENCODE_CONFIG_CONTENT: JSON.stringify({ commands: { compact: { template: "Child $ARGUMENTS" } } }) };
+  const { session } = await emptySession(editor);
+  editor.backend.options.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ commands: { compact: { template: "Later override $ARGUMENTS" } } });
+  await session.requestHandler({ prompt: "/compact question", attempt: 0 }, { history: [] }, { markdown() {}, push() {} }, token);
+  assert.equal((await traffic(editor.backend, "session/prompt"))[0].params.prompt[0].text, "Child question");
+});
+
 test("local slash native/wire mapping never enters workspace storage", async (t) => {
   localTemplate(t, 'Review $ARGUMENTS');
   const editor = configured(t, "commands");
@@ -958,6 +973,49 @@ test("native model bridge publishes session-scoped metadata without starting ACP
   assert.equal(models[0].maxOutputTokens, 0);
   assert.equal(backend.client, undefined);
   assert.ok(context.subscriptions.includes(entry.registration));
+});
+
+test("launch environment manifest restricts overrides to machine settings with literal string values", () => {
+  const setting = manifest.contributes.configuration.properties["opencodeNativeChat.env"];
+  assert.ok(setting, "Launch environment must be exposed in editor settings");
+  assert.equal(setting.type, "object");
+  assert.deepEqual(setting.additionalProperties, { type: "string" });
+  assert.deepEqual(setting.default, {});
+  assert.equal(setting.scope, "machine", "Workspace settings must not override executable environment");
+});
+
+test("activation passes configured environment only to the lazy ACP child and preserves inherited variables", async (t) => {
+  const { vscode, context } = api();
+  const inherited = "OPENCODE_NATIVE_CHAT_TEST_INHERITED";
+  const overridden = "OPENCODE_NATIVE_CHAT_TEST_OVERRIDE";
+  const previous = { [inherited]: process.env[inherited], [overridden]: process.env[overridden] };
+  const previousTls = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+  process.env[inherited] = "inherited value";
+  process.env[overridden] = "parent value";
+  t.after(() => {
+    context.subscriptions.forEach((subscription) => subscription.dispose());
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+  const environment = { [overridden]: "child value", NODE_TLS_REJECT_UNAUTHORIZED: "0" };
+  vscode.workspace.getConfiguration = (section) => {
+    assert.equal(section, "opencodeNativeChat");
+    return { get: (key, fallback) => key === "command" ? process.execPath : key === "env" ? environment : fallback };
+  };
+  vscode.lm.selectChatModels = async () => [];
+  await extension.activateWithApi(vscode, context);
+  const backend = context.subscriptions.find((subscription) => subscription.records instanceof Map);
+  assert.equal(backend.client, undefined, "Reading launch settings must not start ACP");
+  backend.options.args = [path.join(__dirname, "fixtures/agent.cjs")];
+  const connection = await backend.connect();
+  assert.deepEqual(await connection.requestExtension("echo", { control: "environment", keys: [inherited, overridden, "NODE_TLS_REJECT_UNAUTHORIZED"] }), {
+    [inherited]: "inherited value", [overridden]: "child value", NODE_TLS_REJECT_UNAUTHORIZED: "0",
+  });
+  assert.equal(process.env[overridden], "parent value");
+  assert.equal(process.env.NODE_TLS_REJECT_UNAUTHORIZED, previousTls);
+  assert.deepEqual(environment, { [overridden]: "child value", NODE_TLS_REJECT_UNAUTHORIZED: "0" });
 });
 
 test("activation discovers the OpenCode model bridge in a fresh editor catalogue without starting ACP", async (t) => {

@@ -98,6 +98,22 @@ If VS Code cannot find OpenCode, set its executable path:
 
 This setting accepts an executable path, not a shell command or arguments. The extension adds `acp` itself. Configure provider authentication in OpenCode before using the extension.
 
+Set `opencodeNativeChat.env` in **user settings** to pass environment variables to the OpenCode child process. These machine-specific settings are not synchronized or configurable by a workspace. Values must be literal strings; shell expressions and variable substitutions are not evaluated. Overrides are merged over VS Code's inherited environment without changing the extension host's environment. Local slash templates use the same launch environment snapshot to resolve OpenCode configuration sources. The default is `{}`.
+
+For an explicit temporary workaround when OpenCode only works with certificate validation disabled:
+
+```json
+{
+  "opencodeNativeChat.env": {
+    "NODE_TLS_REJECT_UNAUTHORIZED": "0"
+  }
+}
+```
+
+**Warning:** This disables TLS certificate validation for OpenCode and processes that inherit its environment. HTTPS traffic, including credentials, can be intercepted. Fix the expired server/proxy certificate or incorrect system clock, then remove the override. Adding a trusted CA does not itself fix an expired certificate.
+
+Run **Developer: Reload Window** after changing launch settings. Variables set only in an integrated terminal do not configure the extension host.
+
 ### Model / Agent / Reasoning: current implementation
 
 The inline selectors use values confirmed by OpenCode for the current session. Reasoning is hidden when the backend offers no effort choices. Selectors are locked while a response or configuration change is pending.

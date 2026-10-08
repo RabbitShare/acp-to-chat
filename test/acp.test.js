@@ -48,6 +48,19 @@ function client(t, options = {}) {
   return connection;
 }
 
+test("launch without environment overrides inherits parent values without forcing insecure TLS", async (t) => {
+  const result = await client(t).requestExtension("echo", { control: "environment", keys: ["PATH", "NODE_TLS_REJECT_UNAUTHORIZED"] });
+  assert.deepEqual(result, { PATH: process.env.PATH ?? null, NODE_TLS_REJECT_UNAUTHORIZED: process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? null });
+});
+
+test("rejects malformed launch environment before spawning without exposing values", (t) => {
+  const spawn = t.mock.method(require("node:child_process"), "spawn", () => { throw new Error("Unexpected process launch"); });
+  for (const env of [null, [], "secret", { KEY: 0 }, { "": "secret" }, { "BAD=KEY": "secret" }, { "BAD\0KEY": "secret" }, { KEY: "secret\0value" }]) {
+    assert.throws(() => client(t, { env }), (error) => /Invalid.*environment/.test(error.message) && !error.message.includes("secret"));
+  }
+  assert.equal(spawn.mock.callCount(), 0);
+});
+
 test("correlates concurrent responses received out of order", async (t) => {
   const connection = client(t);
   const [first, second] = await Promise.all([connection.requestExtension("echo", { n: 1 }), connection.requestExtension("echo", { n: 2 })]);

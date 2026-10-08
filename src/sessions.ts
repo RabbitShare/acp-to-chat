@@ -32,6 +32,7 @@ interface SessionOptions {
   command: string;
   args?: string[];
   cwd?: string;
+  env?: Record<string, string>;
   permission: (params: RequestPermissionRequest, signal: AbortSignal) => string | undefined | Promise<string | undefined>;
   onLog?: (text: string) => void;
 }
@@ -45,9 +46,9 @@ export class Sessions extends EventEmitter<{ status: [record: SessionRecord, sta
   private promptTrace = 0;
   private pendingCommands = new Map<string, AvailableCommand[]>();
 
-  constructor({ command, args = ["acp"], cwd, permission, onLog = () => {} }: SessionOptions) {
+  constructor({ command, args = ["acp"], cwd, env, permission, onLog = () => {} }: SessionOptions) {
     super();
-    this.options = { command, args, cwd, permission, onLog };
+    this.options = { command, args, cwd, env, permission, onLog };
     this.records = new Map<string, SessionRecord>();
   }
 
@@ -55,6 +56,7 @@ export class Sessions extends EventEmitter<{ status: [record: SessionRecord, sta
     if (!this.ready) {
       const connection = new AcpClient(this.options.command, this.options.args, {
         cwd: this.options.cwd,
+        env: this.options.env,
         onLog: this.options.onLog,
         onRequest: (method, params) => this.requestPermission(method, params),
       });

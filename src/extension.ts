@@ -345,7 +345,7 @@ export function register(vscode: EditorApi, context: AdapterContext, backend: Se
               sessionCommands.validateReferences(request.references ?? [], current);
               validateCommand();
               const directories = vscode.workspace.getConfiguration("opencodeNativeChat", vscode.Uri.from({ scheme: "file", path: current.cwd })).get<string[]>("commandTemplateDirectories", []);
-              return expandCommandTemplate(current.cwd, text, { directories, processCwd: backend.options.cwd });
+              return expandCommandTemplate(current.cwd, text, { directories, processCwd: backend.options.cwd, environment: current.connection?.environment });
             } : undefined);
             sessionOptions.refresh();
             await pending;
@@ -385,8 +385,10 @@ export function register(vscode: EditorApi, context: AdapterContext, backend: Se
 export async function activateWithApi(vscode: EditorApi, context: AdapterContext) {
   const output = vscode.window.createOutputChannel("OpenCode Native Chat");
   context.subscriptions.push(output);
+  const configuration = vscode.workspace.getConfiguration("opencodeNativeChat");
   const backend = new Sessions({
-    command: vscode.workspace.getConfiguration("opencodeNativeChat").get("command", "opencode"),
+    command: configuration.get("command", "opencode"),
+    env: configuration.get<Record<string, string>>("env", {}),
     cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
     permission: (params, signal) => choosePermission(vscode, params, signal),
     onLog: (text) => output.append(text),

@@ -20,7 +20,11 @@ assert.ok(manifest.enabledApiProposals.includes("chatSessionCustomizationProvide
 assert.ok(manifest.enabledApiProposals.includes("chatProvider"), "[check] session-targeted model metadata requires chatProvider");
 assert.ok(manifest.contributes.languageModelChatProviders.some((provider) => provider.vendor === "opencode"));
 assert.equal(manifest.capabilities.untrustedWorkspaces.supported, false);
-JSON.parse(readFileSync(path.join(root, ".vscode/launch.json"), "utf8"));
+const launch = JSON.parse(readFileSync(path.join(root, ".vscode/launch.json"), "utf8"));
+for (const configuration of launch.configurations) {
+  assert.ok(configuration.args.includes(`--enable-proposed-api=${manifest.publisher}.${manifest.name}`),
+    `[check] ${configuration.name} must enable proposed API for the manifest's extension ID`);
+}
 JSON.parse(readFileSync(path.join(root, ".vscode/tasks.json"), "utf8"));
 
 for (const file of [

@@ -36,7 +36,7 @@ code --new-window \
   --user-data-dir="$EXTENSION_DIR/test/.editor-profile" \
   --extensions-dir="$EXTENSION_DIR/test/.editor-extensions" \
   --extensionDevelopmentPath="$EXTENSION_DIR" \
-  --enable-proposed-api=local.opencode-native-chat \
+  --enable-proposed-api=RabbitShare.opencode-native-chat \
   /absolute/path/to/your/project
 ```
 
@@ -221,7 +221,7 @@ code --new-window \
   --extensions-dir="$EXTENSION_DIR/test/.editor-extensions" \
   --extensionDevelopmentPath="$EXTENSION_DIR" \
   --extensionTestsPath="$EXTENSION_DIR/test/editor-smoke.cjs" \
-  --enable-proposed-api=local.opencode-native-chat \
+  --enable-proposed-api=RabbitShare.opencode-native-chat \
   "$EXTENSION_DIR"
 ```
 

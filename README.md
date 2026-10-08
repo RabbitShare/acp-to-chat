@@ -47,7 +47,7 @@ code --new-window \
   --user-data-dir="$EXTENSION_DIR/test/.editor-profile" \
   --extensions-dir="$EXTENSION_DIR/test/.editor-extensions" \
   --extensionDevelopmentPath="$EXTENSION_DIR" \
-  --enable-proposed-api=local.opencode-native-chat \
+  --enable-proposed-api=RabbitShare.opencode-native-chat \
   /absolute/path/to/your/project
 ```
 
@@ -63,6 +63,28 @@ Alternatively, open the extension directory in VS Code and press **F5** with the
 4. Select the available session options, enter a message, and press **Send**.
 
 Creating a session does not generate a response; generation starts on Send. The top **+** in OpenCode Chat uses the same New Session action.
+
+## Installing a shared VSIX
+
+This extension uses proposed APIs. Installing a VSIX does not enable them, and the extension cannot grant itself access. Microsoft's [proposed API guide](https://code.visualstudio.com/api/advanced-topics/using-proposed-api) supports sharing VSIX packages, not publishing proposed-API extensions to the Marketplace. It recommends Insiders; this project still targets the VS Code 1.140.0 API contract.
+
+1. Install the package through **Extensions: Install from VSIX...**.
+2. Run **Preferences: Configure Runtime Arguments** from the Command Palette.
+3. Add the following property to the existing `argv.json` object. Preserve other properties and any existing extension IDs in the array:
+
+   ```json
+   "enable-proposed-api": ["RabbitShare.opencode-native-chat"]
+   ```
+
+4. Fully quit VS Code and reopen it. Reload Window alone does not apply startup arguments.
+
+Alternatively, fully quit the editor and launch it for that run with:
+
+```bash
+code --enable-proposed-api=RabbitShare.opencode-native-chat /absolute/path/to/your/project
+```
+
+Use `code-insiders` for Insiders. Enabling proposed APIs does not make an incompatible editor version compatible.
 
 ## Configuration
 

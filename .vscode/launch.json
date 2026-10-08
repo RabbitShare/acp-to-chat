@@ -10,7 +10,7 @@
       "outFiles": ["${workspaceFolder}/dist/**/*.js"],
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}",
-        "--enable-proposed-api=local.opencode-native-chat",
+        "--enable-proposed-api=RabbitShare.opencode-native-chat",
         "${workspaceFolder}"
       ]
     },
@@ -24,7 +24,7 @@
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}",
         "--extensionTestsPath=${workspaceFolder}/test/editor-smoke.cjs",
-        "--enable-proposed-api=local.opencode-native-chat",
+        "--enable-proposed-api=RabbitShare.opencode-native-chat",
         "${workspaceFolder}"
       ]
     }

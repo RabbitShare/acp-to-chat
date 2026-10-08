@@ -25,7 +25,7 @@ async function run(vscode = require("vscode")) {
   // VS Code 1.140.0 invokes run(testPath, callback), not run(vscodeApi).
   if (typeof vscode === "string") vscode = require("vscode");
   await waitForWorkspaceTrust(vscode);
-  const extension = vscode.extensions.getExtension("local.opencode-native-chat");
+  const extension = vscode.extensions.getExtension("RabbitShare.opencode-native-chat");
   assert.ok(extension, "Development extension was not discovered");
   const controller = await extension.activate();
   assert.equal(controller.id, "opencode");

@@ -8,6 +8,8 @@ require("./template-files.cjs").isolateTemplateFiles();
 const { Sessions } = require("../dist/sessions");
 const extension = require("../dist/extension");
 const { run: runEditorSmoke, waitForWorkspaceTrust } = require("./editor-smoke.cjs");
+const manifest = require("../package.json");
+const extensionId = `${manifest.publisher}.${manifest.name}`;
 
 // Never inspect the developer's global configuration in fixture tests.
 process.env.OPENCODE_CONFIG_DIR = path.join(__dirname, "fixtures/template-config");
@@ -910,7 +912,20 @@ test("reports unavailable proposed API before registering a provider", () => {
   const { vscode, context } = api();
   delete vscode.chat.createChatSessionItemController;
   assert.equal(typeof extension.register, "function", "Native adapter is not implemented");
-  assert.throws(() => extension.register(vscode, context, {}), /enable-proposed-api/);
+  assert.throws(() => extension.register(vscode, context, {}), (error) => {
+    assert.ok(error.message.includes(`--enable-proposed-api=${extensionId}`));
+    return true;
+  });
+});
+
+test("reports the current extension ID when proposed API registration is denied", () => {
+  const { vscode, context } = api();
+  vscode.chat.createChatSessionItemController = () => { throw new Error("proposal denied"); };
+  assert.throws(() => extension.register(vscode, context, {}), (error) => {
+    assert.ok(error.message.includes(`--enable-proposed-api=${extensionId}`));
+    assert.match(error.message, /proposal denied/);
+    return true;
+  });
 });
 
 test("dynamic slash reports missing customization API before registering or starting ACP", (t) => {
@@ -1161,6 +1176,7 @@ test("dynamic slash provider projects advertised descriptions and hints as invoc
   const { editor, entries } = await commandSession(t);
   assert.deepEqual(entries.map((item) => item.name), ["compact", "review-test"]);
   assert.ok(entries.every((item) => item.type.id === "prompt" && item.userInvocable && item.source === "extension"));
+  assert.ok(entries.every((item) => item.extensionId === extensionId));
   assert.equal(entries[1].description, "Review project — files to review");
   assert.equal((await traffic(editor.backend, "session/prompt")).length, 0);
 });
@@ -1861,7 +1877,7 @@ test("smoke checks registration and command execution without using the Local-on
     workspace: { isTrusted: true },
     extensions: {
       getExtension: (id) => {
-        assert.equal(id, "local.opencode-native-chat");
+        assert.equal(id, extensionId);
         return { activate: async () => ({ id: "opencode" }) };
       },
     },

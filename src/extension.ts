@@ -119,7 +119,7 @@ export function register(vscode: EditorApi, context: AdapterContext, backend: Se
   if (!folders.length) throw new Error("[register] Open a local workspace folder before using OpenCode");
 
   if (typeof vscode.chat?.createChatSessionItemController !== "function" || typeof vscode.chat?.registerChatSessionContentProvider !== "function") {
-    throw new Error("[register] chatSessionsProvider unavailable; launch VS Code with --enable-proposed-api=local.opencode-native-chat");
+    throw new Error("[register] chatSessionsProvider unavailable; launch VS Code with --enable-proposed-api=RabbitShare.opencode-native-chat");
   }
   if (typeof vscode.lm?.registerLanguageModelChatProvider !== "function") {
     throw new Error("[register] LanguageModelChat provider API unavailable; use VS Code 1.140.0 or a compatible Insiders");
@@ -189,7 +189,7 @@ export function register(vscode: EditorApi, context: AdapterContext, backend: Se
       controller.items.replace([...saved.values()].map(itemFor));
     });
   } catch (error) {
-    throw new Error(`[register] Cannot enable chatSessionsProvider. Launch with --enable-proposed-api=local.opencode-native-chat: ${errorMessage(error)}`);
+    throw new Error(`[register] Cannot enable chatSessionsProvider. Launch with --enable-proposed-api=RabbitShare.opencode-native-chat: ${errorMessage(error)}`);
   }
   context.subscriptions.push(controller);
 

@@ -67,7 +67,7 @@ export function registerSessionCommands(vscode: EditorApi, backend: Sessions,
           content: new TextEncoder().encode(`---\nname: ${JSON.stringify(command.name)}\n---\n`) });
         items.push({ uri, type: vscode.ChatSessionCustomizationType.Prompt, name: command.name,
           description: command.input?.hint ? `${command.description} — ${command.input.hint}` : command.description,
-          source: "extension", extensionId: "local.opencode-native-chat", userInvocable: true });
+          source: "extension", extensionId: "RabbitShare.opencode-native-chat", userInvocable: true });
       }
       published.set(record, items);
       return items;

@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import type { AvailableCommand, RequestPermissionRequest, RequestPermissionResponse, SessionUpdate } from "@agentclientprotocol/sdk";
+import type { AvailableCommand, ContentBlock, RequestPermissionRequest, RequestPermissionResponse, SessionUpdate } from "@agentclientprotocol/sdk";
 import { AcpClient } from "./acp";
 import { errorMessage, isObject, readPermissionParams, readSessionNotification, readOptionalString, isTextContent, readConfigOptions, readAvailableCommands, type SelectConfigOption } from "./protocol";
 
@@ -93,7 +93,8 @@ export class Sessions extends EventEmitter<{ status: [record: SessionRecord, sta
         }
         const capabilities = result.agentCapabilities;
         if (isObject(capabilities) && (capabilities.loadSession === undefined || typeof capabilities.loadSession === "boolean")) {
-          connection.capabilities = capabilities;
+          connection.capabilities = { ...capabilities,
+            embeddedContext: isObject(capabilities.promptCapabilities) && capabilities.promptCapabilities.embeddedContext === true };
         }
         return connection;
       }).catch((error: unknown) => {
@@ -287,7 +288,7 @@ export class Sessions extends EventEmitter<{ status: [record: SessionRecord, sta
   }
 
   async prompt(record: SessionRecord, text: string, signal: AbortSignal, onUpdate: (update: SessionUpdate) => void,
-    beforeSend: () => void = () => {}, prepareText?: () => Promise<string>) {
+    beforeSend: () => void = () => {}, prepareText?: () => Promise<string>, prepareContext?: () => Promise<ContentBlock[]>) {
     // Temporary boundary tracing; no payloads or arbitrary error/stop-reason strings.
     const trace = ++this.promptTrace;
     const diagnostic = (stage: string, state = "") => {
@@ -343,6 +344,8 @@ export class Sessions extends EventEmitter<{ status: [record: SessionRecord, sta
 
       const wireText = prepareText ? await prepareText() : text;
       if (controller.signal.aborted) return { stopReason: "cancelled" };
+      const context = prepareContext ? await prepareContext() : [];
+      if (controller.signal.aborted) return { stopReason: "cancelled" };
 
       // The adapter's live references can be revoked during config/load waits.
       // Recheck synchronously while the prompt slot is still reserved.
@@ -352,7 +355,7 @@ export class Sessions extends EventEmitter<{ status: [record: SessionRecord, sta
       this.emit("status", record, "inProgress");
       started = true;
       diagnostic("acp.rpc.start");
-      const result = await connection.request("session/prompt", { sessionId: record.id, prompt: [{ type: "text", text: wireText }] }, 0);
+      const result = await connection.request("session/prompt", { sessionId: record.id, prompt: [{ type: "text", text: wireText }, ...context] }, 0);
       const stopReason = ["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"].includes(result.stopReason) ? result.stopReason : "other";
       diagnostic("acp.rpc.complete", `stopReason=${stopReason}`);
       this.emit("status", record, "completed");

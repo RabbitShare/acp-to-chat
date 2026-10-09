@@ -14,8 +14,9 @@ assert.equal(manifest.contributes.chatSessions.find((session) => session.type ==
   "[check] sessionType=opencode must use its registered model bridge, not the general model pool");
 assert.equal(manifest.contributes.chatSessions.find((session) => session.type === "opencode").supportsAutoModel, false,
   "[check] synthetic Auto cannot satisfy VS Code 1.140.0 request conversion");
-assert.deepEqual(manifest.contributes.chatSessions.find((session) => session.type === "opencode").capabilities, { supportsPromptAttachments: true },
-  "[check] only prompt capability enables dynamic slash suggestions; checkpoints and other attachments stay disabled");
+assert.deepEqual(manifest.contributes.chatSessions.find((session) => session.type === "opencode").capabilities,
+  { supportsPromptAttachments: true, supportsFileAttachments: true },
+  "[check] file context and dynamic slash prompts are enabled; checkpoints and other attachments stay disabled");
 assert.ok(manifest.enabledApiProposals.includes("chatSessionCustomizationProvider"));
 assert.ok(manifest.enabledApiProposals.includes("chatProvider"), "[check] session-targeted model metadata requires chatProvider");
 assert.ok(manifest.contributes.languageModelChatProviders.some((provider) => provider.vendor === "opencode"));

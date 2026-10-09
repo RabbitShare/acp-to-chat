@@ -134,10 +134,16 @@ Additional Markdown template directories can be configured with `opencodeNativeC
 
 See [supported template sources, substitutions, and restrictions](docs/development.md#local-template-expansion).
 
+### File context
+
+Attach a text file or selection using native Chat. File context included by the editor, including the active file and viewport, is sent to OpenCode as ACP embedded text resources. The extension uses current text documents, so unsaved changes are included; a selection or viewport sends only its range. Opening other files does not scan or attach them automatically.
+
+The limit is 32 file references and 1 MiB of combined UTF-8 context per Send. Local files, remote workspace documents, and already-open untitled documents are supported. Binary, unreadable, unsupported, and oversized attachments fail explicitly before the prompt is sent. The agent must advertise ACP `embeddedContext`; there is no silent fallback to dropping files. External prompt files remain unsupported as slash customizations.
+
 ## Limitations and safety
 
 - Editing sent messages and native **Retry** are disabled. Send a new message instead. After a rejected edit, reopen the saved session; if necessary, run **Developer: Reload Window** first.
-- File attachments, importing all existing OpenCode sessions, session deletion, fork, and integration with VS Code Undo are not implemented.
+- Binary attachments, importing all existing OpenCode sessions, session deletion, fork, and integration with VS Code Undo are not implemented.
 - The session list contains sessions created by this extension in the current workspace, not your entire OpenCode history.
 - Tool permission prompts appear only when OpenCode requests approval. Escape, dismissal, and cancellation never approve a tool.
 - OpenCode executes tools and changes files with its own permissions. **The extension is not a sandbox.**

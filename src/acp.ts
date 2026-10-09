@@ -26,7 +26,7 @@ export class AcpClient extends EventEmitter<{ notification: [method: string, par
   private connection: ClientConnection;
   failure?: Error;
   disposing = false;
-  capabilities: { loadSession?: boolean } = {};
+  capabilities: { loadSession?: boolean; embeddedContext?: boolean } = {};
 
   constructor(command: string, args: string[], { cwd, env, onRequest, onLog = () => {} }: ClientOptions) {
     super();

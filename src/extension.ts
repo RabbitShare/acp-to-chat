@@ -6,14 +6,15 @@ import { errorMessage, isObject, isTextContent } from "./protocol";
 import { registerSessionOptions } from "./session-options";
 import { registerSessionCommands } from "./session-commands";
 import { expandCommandTemplate } from "./command-templates";
+import { prepareFileContext } from "./session-files";
 export { expandCommandTemplate } from "./command-templates";
 
 export type EditorApi = Pick<typeof VSCode,
   "MarkdownString" | "ChatResponseMarkdownPart" | "ChatResponseThinkingProgressPart" |
   "ChatToolInvocationPart" | "ChatRequestTurn2" | "ChatResponseTurn2" | "ChatSessionStatus" | "Uri" | "CancellationTokenSource" |
-  "EventEmitter" | "FileSystemError" | "FileType" | "ChatSessionCustomizationType"> & {
+  "EventEmitter" | "FileSystemError" | "FileType" | "ChatSessionCustomizationType" | "Location" | "Range"> & {
   window: Pick<typeof VSCode.window, "createQuickPick" | "showWorkspaceFolderPick" | "showErrorMessage" | "createOutputChannel">;
-  workspace: Pick<typeof VSCode.workspace, "isTrusted" | "workspaceFolders" | "getConfiguration" | "registerFileSystemProvider">;
+  workspace: Pick<typeof VSCode.workspace, "isTrusted" | "workspaceFolders" | "getConfiguration" | "registerFileSystemProvider" | "textDocuments" | "fs" | "openTextDocument">;
   chat: Pick<typeof VSCode.chat, "createChatParticipant" | "createChatSessionItemController" | "registerChatSessionContentProvider" | "registerChatSessionCustomizationProvider">;
   lm: Pick<typeof VSCode.lm, "registerLanguageModelChatProvider" | "selectChatModels">;
   commands: Pick<typeof VSCode.commands, "registerCommand" | "executeCommand">;
@@ -346,7 +347,10 @@ export function register(vscode: EditorApi, context: AdapterContext, backend: Se
               validateCommand();
               const directories = vscode.workspace.getConfiguration("opencodeNativeChat", vscode.Uri.from({ scheme: "file", path: current.cwd })).get<string[]>("commandTemplateDirectories", []);
               return expandCommandTemplate(current.cwd, text, { directories, processCwd: backend.options.cwd, environment: current.connection?.environment });
-            } : undefined);
+            } : undefined, async () => {
+              sessionCommands.validateReferences(request.references ?? [], current);
+              return prepareFileContext(vscode, request.references ?? [], current.connection?.capabilities.embeddedContext, abort.signal);
+            });
             sessionOptions.refresh();
             await pending;
             log("handler.complete");

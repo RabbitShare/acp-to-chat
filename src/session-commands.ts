@@ -1,6 +1,7 @@
 import type * as VSCode from "vscode";
 import type { EditorApi } from "./extension";
 import type { SessionRecord, Sessions } from "./sessions";
+import { fileReference } from "./session-files";
 
 const SCHEME = "opencode-command";
 // Global commands accepted ahead of prompt customizations by the 1.140.0
@@ -85,6 +86,9 @@ export function registerSessionCommands(vscode: EditorApi, backend: Sessions,
     validateReferences(references: readonly VSCode.ChatPromptReference[], record: SessionRecord) {
       for (const reference of references) {
         const uri = reference.value;
+        // File context is prepared separately; prompt metadata must still pass
+        // command ownership and freshness checks, including before the RPC.
+        if (fileReference(vscode, reference)) continue;
         if (!(uri instanceof vscode.Uri) || files.get(uri.toString())?.record !== record) {
           throw new Error("[OpenCode commands] Unsupported or foreign prompt reference; only current OpenCode command metadata is accepted");
         }

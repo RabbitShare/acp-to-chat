@@ -75,7 +75,8 @@
         "requiresCustomModels": true,
         "supportsAutoModel": false,
         "capabilities": {
-          "supportsPromptAttachments": true
+          "supportsPromptAttachments": true,
+          "supportsFileAttachments": true
         },
         "welcomeTitle": "OpenCode",
         "welcomeMessage": "Uses your existing OpenCode configuration and credentials. Tools run with OpenCode's permissions.",

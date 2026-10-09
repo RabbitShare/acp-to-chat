@@ -20,8 +20,17 @@ function api() {
   class Uri {
     constructor(value) { Object.assign(this, value); }
     static from(value) { return new Uri(value); }
+    with(value) { return new Uri({ ...this, ...value }); }
     toString() { return `${this.scheme}:${this.authority ? `//${this.authority}` : ""}${this.path}${this.query ? `?${this.query}` : ""}${this.fragment ? `#${this.fragment}` : ""}`; }
   }
+  class Range {
+    constructor(startLine, startCharacter, endLine, endCharacter) {
+      this.start = { line: startLine, character: startCharacter };
+      this.end = { line: endLine, character: endCharacter };
+    }
+    isEqual(other) { return ["start", "end"].every((key) => this[key].line === other[key].line && this[key].character === other[key].character); }
+  }
+  class Location { constructor(uri, range) { Object.assign(this, { uri, range }); } }
   class MarkdownString { constructor(value) { this.value = value; } }
   class Part { constructor(value) { this.value = value; } }
   class Tool { constructor(toolName, toolCallId) { Object.assign(this, { toolName, toolCallId }); } }
@@ -86,7 +95,7 @@ function api() {
     },
   };
   const vscode = {
-    Uri, MarkdownString,
+    Uri, Range, Location, MarkdownString,
     FileType: { File: 1, Directory: 2 },
     FileSystemError: { FileNotFound: () => new Error("FileNotFound"), NoPermissions: () => new Error("NoPermissions") },
     ChatSessionCustomizationType: { Prompt: { id: "prompt" } },
@@ -99,6 +108,9 @@ function api() {
     ChatToolInvocationPart: Tool, ChatRequestTurn2: Request, ChatResponseTurn2: Response,
     ChatSessionStatus: { InProgress: 2, Completed: 1, NeedsInput: 3, Failed: 0 },
     workspace: { isTrusted: true, workspaceFolders: [{ uri: { scheme: "file", fsPath: __dirname } }],
+      textDocuments: [],
+      fs: { stat: async (uri) => ({ size: fs.statSync(uri.path).size }) },
+      openTextDocument: async (uri) => textDocument(vscode, uri, fs.readFileSync(uri.path, "utf8")),
       getConfiguration: () => ({ get: (_key, fallback) => fallback }),
       registerFileSystemProvider: (scheme, provider, options) => {
         fileSystems.set(scheme, { provider, options });
@@ -181,6 +193,22 @@ function api() {
 }
 
 const token = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) };
+
+function textDocument(vscode, uri, text) {
+  const lines = text.split("\n");
+  const offset = (position) => lines.slice(0, position.line).reduce((sum, line) => sum + line.length + 1, 0) + position.character;
+  return { uri, lineCount: lines.length,
+    getText: (range) => range ? text.slice(offset(range.start), offset(range.end)) : text,
+    validateRange: (range) => {
+      const clamp = (position) => {
+        const line = Math.min(position.line, lines.length - 1);
+        return { line, character: Math.min(position.character, lines[line].length) };
+      };
+      const start = clamp(range.start), end = clamp(range.end);
+      return new vscode.Range(start.line, start.character, end.line, end.character);
+    },
+  };
+}
 
 function configured(t, scenario = "config", permission = async () => "no", roots = [__dirname]) {
   const editor = api();
@@ -1187,12 +1215,12 @@ for (const stored of [null, { id: "not-an-array", cwd: __dirname }, "not an arra
   });
 }
 
-test("native slash manifest enables dynamic prompts but not checkpoint editing or other attachments", () => {
+test("native manifest enables file and prompt attachments but not checkpoint editing or other attachments", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "../package.json"), "utf8"));
   const session = manifest.contributes.chatSessions.find((item) => item.type === "opencode");
   assert.equal(session.commands, undefined, "Do not duplicate compact or invent availability through static commands");
   assert.ok(manifest.enabledApiProposals.includes("chatSessionCustomizationProvider"));
-  assert.deepEqual(session.capabilities, { supportsPromptAttachments: true });
+  assert.deepEqual(session.capabilities, { supportsPromptAttachments: true, supportsFileAttachments: true });
 });
 
 test("dynamic slash queries stay lazy for drafts, cancelled, foreign and unknown resources", async (t) => {
@@ -1382,6 +1410,140 @@ test("dynamic slash accepts next Send with native virtual reference history", as
   chatContext.history = [new editor.vscode.ChatRequestTurn2("/review-test keep  exact/args", undefined, [reference])];
   await handler({ prompt: "next", attempt: 0, references: [] }, chatContext, { markdown() {}, push() {} }, token);
   assert.equal((await traffic(editor.backend, "session/prompt")).length, 2);
+});
+
+for (const kind of ["file", "selection", "viewport"]) {
+  for (const route of ["participant", "content", "draft"]) test(`ordinary Send forwards implicit editor ${kind} context through ${route}`, async (t) => {
+    const editor = configured(t, "commands");
+    const resource = route === "draft" ? editor.vscode.Uri.from({ scheme: "opencode", path: "/untitled-implicit" })
+      : (await editor.controller.newChatSessionItemHandler({ request: { prompt: "" } }, token)).resource;
+    const session = await editor.vscode.provider.provideChatSessionContent(resource, token);
+    const handler = route === "content" ? session.requestHandler : editor.participants.get("opencode");
+    const uri = editor.vscode.Uri.from({ scheme: "file", path: path.join(__dirname, "fixtures/file-context.txt") });
+    const value = kind === "file" ? uri : new editor.vscode.Location(uri, new editor.vscode.Range(2, 0, 4, 8));
+    const references = [{ id: `vscode.implicit.${kind}`, name: "file:table-page.md", value }];
+    await handler({ prompt: "fix conflicts", references, attempt: 0 },
+      { history: [], chatSessionContext: { chatSessionItem: { resource } } }, { markdown() {}, push() {} }, token);
+    assert.deepEqual((await traffic(editor.backend, "session/prompt")).map((entry) => entry.params.prompt), [[{ type: "text", text: "fix conflicts" },
+      { type: "resource", resource: { uri: kind === "file" ? uri.toString() : uri.with({ fragment: "L3-L5" }).toString(), mimeType: "text/plain",
+        text: kind === "file" ? "line zero\nline one\nline two\nline three\nline four tail\nline five\n" : "line two\nline three\nline fou" } }]]);
+    assert.deepEqual([...editor.backend.records.values()][0].history.filter((turn) => turn.role === "user").map((turn) => turn.text), ["fix conflicts"]);
+  });
+}
+
+test("dynamic slash accepts command metadata alongside implicit editor context", async (t) => {
+  const { editor, item, entries } = await commandSession(t);
+  const uri = editor.vscode.Uri.from({ scheme: "file", path: path.join(__dirname, "fixtures/file-context.txt") });
+  const references = [
+    { id: "vscode.implicit.file", name: "file:table-page.md", value: uri },
+    { id: "vscode.prompt.file", value: entries[1].uri },
+  ];
+  await editor.participants.get("opencode")({ prompt: "/review-test keep notes", references, attempt: 0 },
+    { history: [], chatSessionContext: { chatSessionItem: item } }, { markdown() {}, push() {} }, token);
+  assert.deepEqual((await traffic(editor.backend, "session/prompt"))[0].params.prompt, [{ type: "text", text: "Fixture review keep notes" },
+    { type: "resource", resource: { uri: uri.toString(), mimeType: "text/plain", text: "line zero\nline one\nline two\nline three\nline four tail\nline five\n" } }]);
+});
+
+for (const invalid of ["foreign", "stale", "external", "unknown-implicit", "malformed-implicit", "malformed-location", "malformed-range"]) test(`implicit editor context cannot bypass ${invalid} reference validation`, async (t) => {
+  const { editor, item, entries } = await commandSession(t);
+  const uri = editor.vscode.Uri.from({ scheme: "file", path: "/not-read/table-page.md" });
+  let rejected = { id: "vscode.prompt.file", value: editor.vscode.Uri.from({ scheme: "file", path: "/external.prompt.md" }) };
+  if (invalid === "unknown-implicit") rejected = { id: "vscode.implicit.file.extra", value: uri };
+  if (invalid === "malformed-implicit") rejected = { id: "vscode.implicit.file", value: "not a URI" };
+  if (invalid === "malformed-location") rejected = { id: "vscode.implicit.selection", value: new editor.vscode.Location({ scheme: "file", toString: () => uri.toString() }, new editor.vscode.Range(0, 0, 0, 1)) };
+  if (invalid === "malformed-range") rejected = { id: "vscode.implicit.selection", value: new editor.vscode.Location(uri, undefined) };
+  if (invalid === "foreign") {
+    const other = await editor.controller.newChatSessionItemHandler({ request: { prompt: "" } }, token);
+    const [command] = await editor.vscode.customizations.provider.provideChatSessionCustomizations(other.resource, token);
+    rejected = { id: "vscode.implicit.file", value: command.uri };
+  }
+  if (invalid === "stale") {
+    rejected = { id: "vscode.implicit.viewport", value: { uri: entries[0].uri, range: {} } };
+    await editor.backend.client.requestExtension("echo", { control: "update-commands", sessionId: item.resource.path.slice(1), availableCommands: [] });
+  }
+  editor.vscode.workspace.openTextDocument = async () => { assert.fail("Reject invalid references before reading file context"); };
+  await assert.rejects(editor.participants.get("opencode")({ prompt: "fix conflicts", attempt: 0,
+    references: [{ id: "vscode.implicit.file", name: "file:table-page.md", value: uri }, rejected] },
+    { history: [], chatSessionContext: { chatSessionItem: item } }, { markdown() {}, push() {} }, token), /prompt reference/);
+  assert.deepEqual(editor.backend.records.get(item.resource.path.slice(1)).history, []);
+  assert.equal((await traffic(editor.backend, "session/prompt")).length, 0);
+});
+
+for (const scheme of ["file", "vscode-remote", "untitled"]) test(`file context forwards unsaved ${scheme} text and preserves the next ordinary Send`, async (t) => {
+  const editor = configured(t, "commands");
+  const { item, session } = await emptySession(editor);
+  const uri = editor.vscode.Uri.from({ scheme, path: "/dirty.txt" });
+  editor.vscode.workspace.textDocuments.push(textDocument(editor.vscode, uri, "unsaved text 😀\n"));
+  editor.vscode.workspace.fs.stat = async () => { assert.fail("Do not replace a loaded document with disk content"); };
+  const references = [{ id: uri.toString(), name: "dirty.txt", value: uri }];
+  const context = { history: [], chatSessionContext: { chatSessionItem: item } };
+  await session.requestHandler({ prompt: "check", references, attempt: 0 }, context, { markdown() {}, push() {} }, token);
+  context.history = [new editor.vscode.ChatRequestTurn2("check", undefined, references)];
+  await session.requestHandler({ prompt: "next", attempt: 0 }, context, { markdown() {}, push() {} }, token);
+  assert.deepEqual((await traffic(editor.backend, "session/prompt")).map((entry) => entry.params.prompt), [
+    [{ type: "text", text: "check" }, { type: "resource", resource: { uri: uri.toString(), mimeType: "text/plain", text: "unsaved text 😀\n" } }],
+    [{ type: "text", text: "next" }],
+  ]);
+  assert.equal("history" in editor.data.get("sessions")[0], false);
+});
+
+test("file context sends only an explicitly attached selection", async (t) => {
+  const editor = configured(t, "commands");
+  const { session } = await emptySession(editor);
+  const uri = editor.vscode.Uri.from({ scheme: "file", path: "/dirty.txt" });
+  editor.vscode.workspace.textDocuments.push(textDocument(editor.vscode, uri, "outside\nselected text\noutside"));
+  await session.requestHandler({ prompt: "check", attempt: 0,
+    references: [{ id: `${uri.toString()}[2,1 -> 2,9]`, value: new editor.vscode.Location(uri, new editor.vscode.Range(1, 0, 1, 8)) }] },
+    { history: [] }, { markdown() {}, push() {} }, token);
+  assert.deepEqual((await traffic(editor.backend, "session/prompt"))[0].params.prompt, [{ type: "text", text: "check" },
+    { type: "resource", resource: { uri: uri.with({ fragment: "L2-L2" }).toString(), mimeType: "text/plain", text: "selected" } }]);
+});
+
+for (const failure of ["unsupported", "malformed", "unreadable", "binary", "size", "combined-size", "count", "range", "scheme"]) test(`file context rejects ${failure} without history or ACP prompt`, async (t) => {
+  const editor = configured(t, failure === "unsupported" || failure === "malformed" ? `context-${failure}` : "commands");
+  const { session, record } = await emptySession(editor);
+  const uri = editor.vscode.Uri.from({ scheme: failure === "scheme" ? "https" : "file", path: "/file-context.txt" });
+  let references = [{ id: uri.toString(), value: uri }];
+  editor.vscode.workspace.fs.stat = async () => ({ size: failure === "size" ? 1024 * 1024 + 1 : 10 });
+  editor.vscode.workspace.openTextDocument = async () => {
+    if (["unsupported", "malformed", "size", "count", "scheme"].includes(failure)) assert.fail("Reject before document IO");
+    if (failure === "unreadable") throw new Error("unreadable");
+    return textDocument(editor.vscode, uri, failure === "binary" ? "binary\0data" : failure === "combined-size" ? "😀".repeat(131073) : "text");
+  };
+  if (failure === "combined-size") references = [references[0], references[0]];
+  if (failure === "count") references = Array(33).fill(references[0]);
+  if (failure === "range") references = [{ id: "vscode.implicit.selection", value: new editor.vscode.Location(uri, new editor.vscode.Range(3, 0, 4, 1)) }];
+  await assert.rejects(session.requestHandler({ prompt: "check", references, attempt: 0 }, { history: [] }, { markdown() {}, push() {} }, token),
+    failure === "scheme" ? /reference/ : /\[OpenCode files\]/);
+  assert.deepEqual(record.history, []);
+  assert.equal((await traffic(editor.backend, "session/prompt")).length, 0);
+});
+
+for (const outcome of ["stop", "revoked"]) test(`file context ${outcome} during preparation never appends history or sends a prompt`, { timeout: 5000 }, async (t) => {
+  const { editor, item, entries } = await commandSession(t);
+  const uri = editor.vscode.Uri.from({ scheme: "file", path: "/held.txt" });
+  let entered, release, cancel;
+  const reading = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  editor.vscode.workspace.fs.stat = async () => ({ size: 4 });
+  editor.vscode.workspace.openTextDocument = async () => { entered(); await held; return textDocument(editor.vscode, uri, "text"); };
+  const requestToken = { isCancellationRequested: false, onCancellationRequested: (listener) => { cancel = listener; return { dispose() {} }; } };
+  const send = editor.participants.get("opencode")({ prompt: "/review-test keep notes", attempt: 0,
+    references: [{ id: uri.toString(), value: uri }, { id: "vscode.prompt.file", value: entries[1].uri }] },
+    { history: [], chatSessionContext: { chatSessionItem: item } }, { markdown() {}, push() {} }, requestToken);
+  const result = outcome === "revoked" ? assert.rejects(send, /prompt reference/) : send;
+  await reading;
+  const record = editor.backend.records.get(item.resource.path.slice(1));
+  assert.ok(record.turn, "Reserve Send while reading context");
+  await assert.rejects(editor.backend.prompt(record, "other", new AbortController().signal, () => {}), /already active/);
+  if (outcome === "stop") cancel();
+  else await editor.backend.client.requestExtension("echo", { control: "update-commands", sessionId: record.id, availableCommands: [] });
+  release();
+  await result;
+  assert.deepEqual(record.history, []);
+  assert.equal(record.turn, undefined);
+  assert.equal((await traffic(editor.backend, "session/prompt")).length, 0);
+  assert.equal((await traffic(editor.backend, "session/cancel")).length, 0);
 });
 
 for (const invalid of ["foreign", "stale", "forged", "external"]) test(`dynamic slash rejects ${invalid} prompt references before ACP Send`, async (t) => {

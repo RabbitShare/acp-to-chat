@@ -48,7 +48,7 @@ In the window that opens, run **OpenCode: New Native Chat Session** from the Com
 Sessions are registered as type `OpenCode`; their exact appearance in menus depends on the VS Code version.
 
 Alternatively, open the extension directory in VS Code and press F5 with the **OpenCode Native Chat** configuration.
-Both F5 configurations run the **build extension** task before launch and use sourcemaps from `dist/`; run `npm ci` beforehand.
+Both F5 configurations run the **build extension** task before launch; run `npm ci` beforehand. Bundles in `dist/` are built without sourcemaps, so debugging uses the generated JavaScript rather than the TypeScript sources.
 For actual work, open the desired folder in the Extension Development Host window.
 
 If the GUI cannot find the executable, specify an absolute path in user settings:

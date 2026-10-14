@@ -10,7 +10,5 @@ await build({
   mainFields: ["module", "main"],
   format: "cjs",
   target: "es2022",
-  external: ["vscode"],
-  sourcemap: true,
-  sourcesContent: false
+  external: ["vscode"]
 });

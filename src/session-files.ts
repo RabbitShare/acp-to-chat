@@ -1,6 +1,7 @@
 import type * as VSCode from "vscode";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import type { EditorApi } from "./extension";
+import { Effect } from "effect";
 
 const IMPLICIT_IDS = new Set(["vscode.implicit.file", "vscode.implicit.selection", "vscode.implicit.viewport"]);
 const FILE_SCHEMES = new Set(["file", "vscode-remote", "untitled"]);
@@ -21,8 +22,8 @@ export function fileReference(vscode: EditorApi, reference: VSCode.ChatPromptRef
   return { uri, range };
 }
 
-export async function prepareFileContext(vscode: EditorApi, references: readonly VSCode.ChatPromptReference[],
-  embeddedContext: boolean | undefined, signal: AbortSignal): Promise<ContentBlock[]> {
+export const prepareFileContextEffect = Effect.fnUntraced(function* (vscode: EditorApi, references: readonly VSCode.ChatPromptReference[],
+  embeddedContext: boolean | undefined, signal: AbortSignal) {
   const files = references.flatMap((reference) => {
     const file = fileReference(vscode, reference);
     return file ? [file] : [];
@@ -36,13 +37,13 @@ export async function prepareFileContext(vscode: EditorApi, references: readonly
     if (signal.aborted) return [];
     let document = vscode.workspace.textDocuments.find((candidate) => candidate.uri.toString() === uri.toString());
     if (!document) {
-      let size: number;
-      try { size = (await vscode.workspace.fs.stat(uri)).size; }
-      catch { throw new Error("[OpenCode files] Cannot access the attached text document"); }
+      const stat = yield* Effect.tryPromise({ try: async () => vscode.workspace.fs.stat(uri),
+        catch: () => new Error("[OpenCode files] Cannot access the attached text document") });
+      const size = stat.size;
       if (!Number.isSafeInteger(size) || size < 0 || size > MAX_BYTES) throw new Error("[OpenCode files] File exceeds the 1 MiB context limit");
       if (signal.aborted) return [];
-      try { document = await vscode.workspace.openTextDocument(uri); }
-      catch { throw new Error("[OpenCode files] Cannot open the attachment as a text document"); }
+      document = yield* Effect.tryPromise({ try: async () => vscode.workspace.openTextDocument(uri),
+        catch: () => new Error("[OpenCode files] Cannot open the attachment as a text document") });
     }
     if (signal.aborted) return [];
     if (range && !document.validateRange(range).isEqual(range)) throw new Error("[OpenCode files] Attached range is outside the document");
@@ -54,4 +55,9 @@ export async function prepareFileContext(vscode: EditorApi, references: readonly
       mimeType: "text/plain", text } });
   }
   return context;
+}, Effect.catchDefect((error) => Effect.fail(error instanceof Error ? error : new Error("[OpenCode files] Invalid attachment"))));
+
+export function prepareFileContext(vscode: EditorApi, references: readonly VSCode.ChatPromptReference[],
+  embeddedContext: boolean | undefined, signal: AbortSignal): Promise<ContentBlock[]> {
+  return Effect.runPromise(prepareFileContextEffect(vscode, references, embeddedContext, signal));
 }

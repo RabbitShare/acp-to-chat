@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const path = require("node:path");
 const { Writable } = require("node:stream");
 const { AcpClient } = require("../dist/acp");
+const { Effect, Fiber } = require("effect");
 const { $defs: protocolSchemas } = require("@agentclientprotocol/sdk/schema/schema.json");
 
 // Evaluate only the JSON Schema keywords used by these wire fixtures. This uses
@@ -51,6 +52,39 @@ function client(t, options = {}) {
 test("launch without environment overrides inherits parent values without forcing insecure TLS", async (t) => {
   const result = await client(t).requestExtension("echo", { control: "environment", keys: ["PATH", "NODE_TLS_REJECT_UNAUTHORIZED"] });
   assert.deepEqual(result, { PATH: process.env.PATH ?? null, NODE_TLS_REJECT_UNAUTHORIZED: process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? null });
+});
+
+test("Effect request is lazy and interruption cannot abandon an SDK request before shared close", { timeout: 2000 }, async (t) => {
+  const connection = client(t);
+  assert.equal(typeof connection.requestExtensionEffect, "function");
+  const sent = [];
+  const write = connection.child.stdin.write;
+  t.mock.method(connection.child.stdin, "write", function (bytes, ...args) {
+    sent.push(JSON.parse(Buffer.from(bytes).toString()));
+    return write.call(this, bytes, ...args);
+  });
+  const request = connection.requestExtensionEffect("hang", {}, 0);
+  assert.equal(sent.length, 0);
+  const fiber = Effect.runFork(request);
+  await new Promise(setImmediate);
+  let interrupted = false;
+  const stopped = Effect.runPromise(Fiber.interrupt(fiber)).then(() => { interrupted = true; });
+  await new Promise(setImmediate);
+  assert.equal(interrupted, false, "Stop must retain the SDK await until shared close");
+  connection.dispose();
+  await stopped;
+  assert.ok(connection.failure);
+});
+
+test("Effect disposal joins physical cleanup and prohibits subsequent RPC and notification", { timeout: 2000 }, async (t) => {
+  const connection = client(t);
+  assert.equal(typeof connection.disposeEffect, "function");
+  await connection.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+  await Effect.runPromise(connection.disposeEffect());
+  assert.notEqual(connection.child.exitCode ?? connection.child.signalCode, null);
+  await assert.rejects(connection.requestExtension("echo", {}), /Connection closed/);
+  await assert.rejects(connection.notify("session/cancel", { sessionId: "session-1" }), /Connection closed/);
+  await Effect.runPromise(connection.disposeEffect());
 });
 
 test("rejects malformed launch environment before spawning without exposing values", (t) => {

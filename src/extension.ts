@@ -1,13 +1,15 @@
 import { isAbsolute } from "node:path";
+import { Deferred, Effect, Exit, Fiber, Scope, Semaphore } from "effect";
 import { Sessions, type SavedSession, type SessionRecord, type SessionStatus } from "./sessions";
 import type * as VSCode from "vscode";
 import type { RequestPermissionRequest, SessionUpdate, ToolCallUpdate } from "@agentclientprotocol/sdk";
 import { errorMessage, isObject, isTextContent } from "./protocol";
 import { registerSessionOptions } from "./session-options";
 import { registerSessionCommands } from "./session-commands";
-import { expandCommandTemplate } from "./command-templates";
-import { prepareFileContext } from "./session-files";
-export { expandCommandTemplate } from "./command-templates";
+import { expandCommandTemplateEffect } from "./command-templates";
+import { prepareFileContextEffect } from "./session-files";
+export { expandCommandTemplate, expandCommandTemplateEffect } from "./command-templates";
+export { prepareFileContext, prepareFileContextEffect } from "./session-files";
 
 export type EditorApi = Pick<typeof VSCode,
   "MarkdownString" | "ChatResponseMarkdownPart" | "ChatResponseThinkingProgressPart" |
@@ -28,6 +30,7 @@ export interface AdapterContext {
 type ToolState = ToolCallUpdate;
 type RenderedPart = VSCode.ChatResponseMarkdownPart | VSCode.ChatResponseThinkingProgressPart | VSCode.ChatToolInvocationPart;
 type NativeSession = Omit<VSCode.ChatSession, "requestHandler"> & { requestHandler: VSCode.ChatRequestHandler };
+export type NativeRunner = <A, E>(effect: Effect.Effect<A, E>) => Promise<A>;
 
 const SESSION_TYPE = "opencode";
 const PARTICIPANT = SESSION_TYPE;
@@ -80,38 +83,39 @@ export function renderUpdate(vscode: Pick<EditorApi, "MarkdownString" | "ChatRes
   }
 }
 
-export function choosePermission(vscode: { window: Pick<EditorApi["window"], "createQuickPick"> }, params: RequestPermissionRequest, signal: AbortSignal): Promise<string | undefined> {
-  if (signal.aborted) return Promise.resolve(undefined);
+export const choosePermissionEffect = Effect.fnUntraced(function* (vscode: { window: Pick<EditorApi["window"], "createQuickPick"> }, params: RequestPermissionRequest, signal: AbortSignal) {
+  if (signal.aborted) return undefined;
+  const answer = yield* Deferred.make<string | undefined>();
+  const picker = yield* Effect.acquireRelease(
+    Effect.sync(() => vscode.window.createQuickPick<VSCode.QuickPickItem & { optionId: string }>()),
+    (picker) => Effect.sync(() => picker.dispose()));
+  const input = display(params.toolCall.rawInput);
+  picker.title = `OpenCode: ${params.toolCall.title ?? params.toolCall.toolCallId}`;
+  picker.placeholder = `session=${params.sessionId} tool=${params.toolCall.toolCallId}`;
+  picker.items = params.options.map((option) => ({
+    label: option.name,
+    description: option.kind,
+    detail: input,
+    optionId: option.optionId,
+  }));
+  const finish = (optionId: string | undefined) => Deferred.doneUnsafe(answer, Effect.succeed(signal.aborted ? undefined : optionId));
+  const cancel = () => finish(undefined);
+  yield* Effect.acquireRelease(Effect.sync(() => picker.onDidAccept(() => finish(picker.selectedItems[0]?.optionId))),
+    (subscription) => Effect.sync(() => subscription.dispose()));
+  yield* Effect.acquireRelease(Effect.sync(() => picker.onDidHide(cancel)),
+    (subscription) => Effect.sync(() => subscription.dispose()));
+  yield* Effect.acquireRelease(Effect.sync(() => signal.addEventListener("abort", cancel, { once: true })),
+    () => Effect.sync(() => signal.removeEventListener("abort", cancel)));
+  if (signal.aborted) return undefined;
+  picker.show();
+  // Never preselect an approval. Enter without an explicit selection cancels.
+  picker.activeItems = [];
+  const optionId = yield* Deferred.await(answer);
+  return signal.aborted ? undefined : optionId;
+}, Effect.scoped, Effect.catchDefect((error) => Effect.fail(error)));
 
-  return new Promise<string | undefined>((resolve) => {
-    const picker = vscode.window.createQuickPick<VSCode.QuickPickItem & { optionId: string }>();
-    const input = display(params.toolCall.rawInput);
-    picker.title = `OpenCode: ${params.toolCall.title ?? params.toolCall.toolCallId}`;
-    picker.placeholder = `session=${params.sessionId} tool=${params.toolCall.toolCallId}`;
-    picker.items = params.options.map((option) => ({
-      label: option.name,
-      description: option.kind,
-      detail: input,
-      optionId: option.optionId,
-    }));
-    let done = false;
-    const finish = (optionId: string | undefined) => {
-      if (done) return;
-      done = true;
-      signal.removeEventListener("abort", cancel);
-      accept.dispose();
-      hide.dispose();
-      picker.dispose();
-      resolve(signal.aborted ? undefined : optionId);
-    };
-    const cancel = () => finish(undefined);
-    const accept = picker.onDidAccept(() => finish(picker.selectedItems[0]?.optionId));
-    const hide = picker.onDidHide(() => finish(undefined));
-    signal.addEventListener("abort", cancel, { once: true });
-    picker.show();
-    // Never preselect an approval. Enter without an explicit selection cancels.
-    picker.activeItems = [];
-  });
+export function choosePermission(vscode: { window: Pick<EditorApi["window"], "createQuickPick"> }, params: RequestPermissionRequest, signal: AbortSignal): Promise<string | undefined> {
+  return Effect.runPromise(choosePermissionEffect(vscode, params, signal));
 }
 
 export function register(vscode: EditorApi, context: AdapterContext, backend: Sessions) {
@@ -129,20 +133,30 @@ export function register(vscode: EditorApi, context: AdapterContext, backend: Se
     throw new Error("[register] chatSessionCustomizationProvider unavailable; use VS Code 1.140.0 or a compatible Insiders with proposed API enabled");
   }
 
+  // Synchronous scope ownership avoids lazy runtime initialization changing admission order.
+  const application = Scope.makeUnsafe();
+  let disposed = false;
+  const run: NativeRunner = (effect) => disposed
+    ? Promise.reject(new Error("[OpenCode] Native adapter disposed"))
+    : Effect.runPromise(effect.pipe(Effect.forkIn(application, { startImmediately: true }), Effect.flatMap(Fiber.join)));
+  context.subscriptions.push({ dispose() {
+    if (disposed) return;
+    disposed = true;
+    Effect.runFork(Scope.close(application, Exit.void));
+  } });
+
   // Like the 1.140.0 Copilot CLI provider, this metadata satisfies native request conversion.
   // Generation stays in the session participant; zero limits/counts mean unknown, not an ACP limit.
   context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider(SESSION_TYPE, {
-    provideLanguageModelChatInformation: async () => [{
+    provideLanguageModelChatInformation: () => run(Effect.sync(() => [{
       id: "configured", name: "OpenCode (configured)", family: "opencode", version: "",
       tooltip: "Uses the model configured in OpenCode. Token limits and counting are unavailable in this bridge.",
       maxInputTokens: 0, maxOutputTokens: 0,
       isDefault: true, isUserSelectable: true, targetChatSessionType: SESSION_TYPE,
       capabilities: { toolCalling: true, imageInput: false },
-    }],
-    provideLanguageModelChatResponse: async () => {
-      throw new Error("[OpenCode model bridge] Use an OpenCode native chat session; direct language model requests are not supported");
-    },
-    provideTokenCount: async () => 0,
+    }])),
+    provideLanguageModelChatResponse: () => run(Effect.fail(new Error("[OpenCode model bridge] Use an OpenCode native chat session; direct language model requests are not supported"))),
+    provideTokenCount: () => run(Effect.succeed(0)),
   }));
 
   const stored = context.workspaceState.get<unknown>("sessions", []);
@@ -150,12 +164,12 @@ export function register(vscode: EditorApi, context: AdapterContext, backend: Se
     .filter((record: unknown): record is SavedSession => isObject(record) && typeof record.id === "string" && typeof record.cwd === "string" && isAbsolute(record.cwd) && folders.some((folder) => folder.uri.fsPath === record.cwd) &&
       (record.label === undefined || typeof record.label === "string") && (record.created === undefined || typeof record.created === "number"))
     .map((record) => [record.id, record]));
-  const aliases = new Map<string, Promise<SessionRecord>>();
-  let write = Promise.resolve();
+  const aliases = new Map<string, Deferred.Deferred<SessionRecord, unknown>>();
+  const writer = Semaphore.makeUnsafe(1);
   const persist = () => {
     const snapshot = [...saved.values()];
-    write = write.catch(() => {}).then(() => context.workspaceState.update("sessions", snapshot));
-    return write;
+    return Effect.uninterruptible(Effect.tryPromise({ try: async () => context.workspaceState.update("sessions", snapshot), catch: (error) => error }))
+      .pipe(Semaphore.withPermit(writer));
   };
   const resourceFor = (id: string) => vscode.Uri.from({ scheme: SESSION_TYPE, path: `/${id}` });
   // Temporary boundary tracing: never include prompts, references, responses or errors.
@@ -164,7 +178,7 @@ export function register(vscode: EditorApi, context: AdapterContext, backend: Se
     try { backend.options.onLog(`[DEBUG-native-send] stage=${stage} ${state}\n`); }
     catch { /* Diagnostics must not change Send behavior. */ }
   };
-  const participant = vscode.chat.createChatParticipant(PARTICIPANT, async (request, chatContext, stream, token) => {
+  const participant = vscode.chat.createChatParticipant(PARTICIPANT, (request, chatContext, stream, token) => run(Effect.gen(function* () {
     const resource = chatContext.chatSessionContext?.chatSessionItem.resource;
     diagnostic("participant.enter", `ownResource=${resource?.scheme === SESSION_TYPE} cancelled=${token.isCancellationRequested}`);
     if (resource?.scheme !== SESSION_TYPE) {
@@ -178,17 +192,17 @@ export function register(vscode: EditorApi, context: AdapterContext, backend: Se
 
     // VS Code 1.140.0 routes native sends through the participant whose ID matches the session type.
     diagnostic("participant.content.wait", `cancelled=${token.isCancellationRequested}`);
-    const session = await provider.provideChatSessionContent(resource, token);
+    yield* contentEffect(resource, token);
     diagnostic("participant.content.ready", `cancelled=${token.isCancellationRequested}`);
-    return session.requestHandler(request, chatContext, stream, token);
-  });
+    return yield* requestEffect(resource, request, chatContext, stream, token);
+  }).pipe(Effect.catchDefect((error) => Effect.fail(error)))));
   context.subscriptions.push(participant, backend);
 
   let controller: VSCode.ChatSessionItemController;
   try {
-    controller = vscode.chat.createChatSessionItemController(SESSION_TYPE, async () => {
+    controller = vscode.chat.createChatSessionItemController(SESSION_TYPE, () => run(Effect.sync(() => {
       controller.items.replace([...saved.values()].map(itemFor));
-    });
+    })));
   } catch (error) {
     throw new Error(`[register] Cannot enable chatSessionsProvider. Launch with --enable-proposed-api=RabbitShare.opencode-native-chat: ${errorMessage(error)}`);
   }
@@ -204,47 +218,51 @@ export function register(vscode: EditorApi, context: AdapterContext, backend: Se
     return item;
   }
 
-  async function remember(record: SavedSession) {
+  const remember = Effect.fnUntraced(function* (record: SavedSession) {
     saved.set(record.id, { id: record.id, cwd: record.cwd, label: record.label, created: record.created });
-    await persist();
-  }
+    yield* persist();
+  });
 
-  async function create(prompt: string, token: VSCode.CancellationToken) {
+  const create = Effect.fnUntraced(function* (prompt: string, token: VSCode.CancellationToken) {
     if (token.isCancellationRequested) throw new Error("[create] Session creation cancelled");
-    const folder = folders.length === 1 ? folders[0] : await vscode.window.showWorkspaceFolderPick({ placeHolder: "Choose the OpenCode working directory" });
+    const folder = folders.length === 1 ? folders[0] : yield* Effect.tryPromise({
+      try: async () => vscode.window.showWorkspaceFolderPick({ placeHolder: "Choose the OpenCode working directory" }), catch: (error) => error });
     if (!folder || token.isCancellationRequested) throw new Error("[create] Working directory selection cancelled");
-    const record = await backend.create(folder.uri.fsPath);
+    const record = yield* backend.createEffect(folder.uri.fsPath);
     if (prompt) record.label = prompt.slice(0, 80);
-    await remember(record);
+    yield* remember(record);
     const item = itemFor(record);
     controller.items.add(item);
     return item;
-  }
+  }, Effect.catchDefect((error) => Effect.fail(error)));
 
-  controller.newChatSessionItemHandler = (request, token) => create(promptText(request.request), token);
+  controller.newChatSessionItemHandler = (request, token) => run(create(promptText(request.request), token));
 
-  async function recordFor(resource: VSCode.Uri, prompt: string, token: VSCode.CancellationToken): Promise<SessionRecord> {
+  const recordFor = Effect.fnUntraced(function* (resource: VSCode.Uri, prompt: string, token: VSCode.CancellationToken) {
     if (resource.scheme !== SESSION_TYPE) throw new Error(`[recordFor] Invalid scheme=${resource.scheme}`);
     const id = resource.path.slice(1);
 
     if (id.startsWith("untitled-")) {
       const key = resource.toString();
       const existing = aliases.get(key);
-      if (existing) return existing;
-      const pending = create(prompt, token).then((item) => {
+      if (existing) return yield* Deferred.await(existing);
+      const pending = Deferred.makeUnsafe<SessionRecord, unknown>();
+      aliases.set(key, pending);
+      yield* create(prompt, token).pipe(Effect.map((item) => {
         const record = backend.records.get(item.resource.path.slice(1));
         if (!record) throw new Error(`[recordFor] Created session not found resource=${item.resource.toString()}`);
         return record;
-      });
-      aliases.set(key, pending);
-      pending.catch(() => aliases.delete(key));
-      return pending;
+      }), Effect.catchDefect((error) => Effect.fail(error)), Effect.exit, Effect.flatMap((result) => {
+        if (Exit.isFailure(result) && aliases.get(key) === pending) aliases.delete(key);
+        return Deferred.done(pending, result);
+      }), Effect.forkIn(application, { startImmediately: true }));
+      return yield* Deferred.await(pending);
     }
 
     const record = saved.get(id);
     if (!record) throw new Error(`[recordFor] Saved session not found sessionId=${id}`);
-    return backend.load(record);
-  }
+    return yield* backend.loadEffect(record);
+  }, Effect.catchDefect((error) => Effect.fail(error)));
 
   function historyFor(record: SessionRecord) {
     return record.history.map((turn) => {
@@ -256,20 +274,22 @@ export function register(vscode: EditorApi, context: AdapterContext, backend: Se
   }
 
   const sessionOptions = registerSessionOptions(controller, backend, (resource, token) => recordFor(resource, "", token),
-    (message) => vscode.window.showErrorMessage(message));
+    (message) => vscode.window.showErrorMessage(message), run);
   context.subscriptions.push(sessionOptions);
-  const sessionCommands = registerSessionCommands(vscode, backend, async (resource) => {
+  const sessionCommands = registerSessionCommands(vscode, backend, Effect.fnUntraced(function* (resource) {
     const alias = aliases.get(resource.toString());
-    if (alias) return backend.load(await alias);
+    if (alias) return yield* backend.loadEffect(yield* Deferred.await(alias));
     const record = saved.get(resource.path.slice(1));
-    return record && resource.toString() === resourceFor(record.id).toString() ? backend.load(record) : undefined;
-  });
+    return record && resource.toString() === resourceFor(record.id).toString() ? yield* backend.loadEffect(record) : undefined;
+  }), run);
   context.subscriptions.push(sessionCommands);
 
   const statusListener = (record: SessionRecord, status: SessionStatus) => {
     sessionOptions.refresh();
     controller.items.add(itemFor(record, status));
-    remember(record).catch((error: unknown) => vscode.window.showErrorMessage(`[remember] sessionId=${record.id}: ${errorMessage(error)}`));
+    void run(remember(record).pipe(Effect.catch((error) => Effect.sync(() => {
+      vscode.window.showErrorMessage(`[remember] sessionId=${record.id}: ${errorMessage(error)}`);
+    })))).catch(() => { /* Application-scope interruption is normal during disposal. */ });
   };
   backend.on("status", statusListener);
   context.subscriptions.push({ dispose: () => backend.off("status", statusListener) });
@@ -277,116 +297,117 @@ export function register(vscode: EditorApi, context: AdapterContext, backend: Se
   backend.on("failure", failureListener);
   context.subscriptions.push({ dispose: () => backend.off("failure", failureListener) });
 
-  const provider: { provideChatSessionContent(resource: VSCode.Uri, token: VSCode.CancellationToken, context?: { inputState?: VSCode.ChatSessionInputState }): Promise<NativeSession> } = {
-    async provideChatSessionContent(resource, token, contentContext) {
-      diagnostic("content.enter", `draft=${resource.path.startsWith("/untitled-")} cancelled=${token.isCancellationRequested}`);
-      const record = resource.path.startsWith("/untitled-") ? undefined : await recordFor(resource, "", token);
-      diagnostic("content.ready", `materialized=${!!record} cancelled=${token.isCancellationRequested}`);
+  const contentEffect = Effect.fnUntraced(function* (resource: VSCode.Uri, token: VSCode.CancellationToken, contentContext?: { inputState?: VSCode.ChatSessionInputState }): Effect.fn.Return<NativeSession, unknown> {
+    diagnostic("content.enter", `draft=${resource.path.startsWith("/untitled-")} cancelled=${token.isCancellationRequested}`);
+    const record = resource.path.startsWith("/untitled-") ? undefined : yield* recordFor(resource, "", token);
+    diagnostic("content.ready", `materialized=${!!record} cancelled=${token.isCancellationRequested}`);
 
-      return {
-        title: record?.label ?? "OpenCode",
-        history: record ? historyFor(record) : [],
-        options: sessionOptions.provide(resource, record, contentContext?.inputState),
-        async requestHandler(request, chatContext, stream, requestToken) {
-          const abort = new AbortController();
-          const cancellation = requestToken.onCancellationRequested(() => abort.abort());
-          if (requestToken.isCancellationRequested) abort.abort();
-          const trace = ++requestTrace;
-          let updates = 0;
-          const log = (stage: string) => diagnostic(stage, `handler=${trace} cancelled=${abort.signal.aborted} updates=${updates}`);
-          log("handler.enter");
-          diagnostic("handler.input", `handler=${trace} references=${request.references?.length ?? 0} command=${typeof request.command === "string"} retry=${request.attempt > 0}`);
+    return {
+      title: record?.label ?? "OpenCode",
+      history: record ? historyFor(record) : [],
+      options: sessionOptions.provide(resource, record, contentContext?.inputState),
+      requestHandler: (request, chatContext, stream, requestToken) => run(requestEffect(resource, request, chatContext, stream, requestToken)),
+    };
+  }, Effect.catchDefect((error) => Effect.fail(error)));
 
-          try {
-            if (abort.signal.aborted) {
-              log("handler.cancelled");
-              return {};
-            }
-            if (request.attempt > 0) {
-              throw new Error("Retry is disabled: ACP does not replace completed messages. Open the saved session; if history has not been restored, run Developer: Reload Window and open it again. Send a new message.");
-            }
-            const currentResource = chatContext.chatSessionContext?.chatSessionItem.resource ?? resource;
-            const text = promptText(request);
-            log("record.wait");
-            const current = await recordFor(currentResource, text, requestToken);
-            log("record.ready");
-            log("references.check");
-            sessionCommands.validateReferences(request.references ?? [], current);
-            log("references.accepted");
-            // Native edit/Retry can shorten history before invoking us. Never append
-            // that replacement to the unchanged ACP conversation, even via a command.
-            const nativeRequests = (chatContext.history ?? []).filter((turn) => turn instanceof vscode.ChatRequestTurn2);
-            const validateHistory = () => {
-              const previousRequests = current.history.filter((turn) => turn.role === "user");
-              if (previousRequests.some((turn, index) => !nativeRequests[index] || promptText(nativeRequests[index]) !== (turn.nativeText ?? turn.text))) {
-                throw new Error("Editing sent messages is disabled: ACP does not support history rollback. Open the saved session; if history has not been restored, run Developer: Reload Window and open it again. Send a new message.");
-              }
-            };
-            validateHistory();
-            const commandName = /^\/([^\s]+)/.exec(text.trimStart())?.[1];
-            const validateCommand = () => {
-              if (commandName && !current.availableCommands.some((command) => command.name === commandName)) {
-                throw new Error("[OpenCode commands] Command is not advertised by the current session; select an available command");
-              }
-            };
-            const tools = new Map<string, ToolState>();
-            log("prompt.wait");
-            const pending = backend.prompt(current, text, abort.signal, (update) => {
-              if (++updates === 1) log("handler.update.first");
-              const part = renderUpdate(vscode, update, tools);
-              if (part instanceof vscode.ChatResponseMarkdownPart) stream.markdown(part.value);
-              else if (part) stream.push(part);
-            }, () => {
-              log("references.recheck");
-              sessionCommands.validateReferences(request.references ?? [], current);
-              validateHistory();
-              validateCommand();
-              log("references.recheck.accepted");
-            }, commandName ? async () => {
-              sessionCommands.validateReferences(request.references ?? [], current);
-              validateCommand();
-              const directories = vscode.workspace.getConfiguration("opencodeNativeChat", vscode.Uri.from({ scheme: "file", path: current.cwd })).get<string[]>("commandTemplateDirectories", []);
-              return expandCommandTemplate(current.cwd, text, { directories, processCwd: backend.options.cwd, environment: current.connection?.environment });
-            } : undefined, async () => {
-              sessionCommands.validateReferences(request.references ?? [], current);
-              return prepareFileContext(vscode, request.references ?? [], current.connection?.capabilities.embeddedContext, abort.signal);
-            });
-            sessionOptions.refresh();
-            await pending;
-            log("handler.complete");
-            return {};
-          } catch (error) {
-            log("handler.failed");
-            if (abort.signal.aborted) return {};
-            // VS Code 1.140.0 ignores a session handler's returned ChatResult, but renders thrown errors.
-            throw new Error(`[requestHandler] resource=${resource.toString()}: ${errorMessage(error)}`, { cause: error });
-          } finally {
-            log("handler.cleanup");
-            sessionOptions.refresh();
-            cancellation.dispose();
-            abort.abort();
-          }
-        },
+  const requestEffect = Effect.fnUntraced(function* (resource: VSCode.Uri, request: VSCode.ChatRequest,
+    chatContext: VSCode.ChatContext, stream: VSCode.ChatResponseStream, requestToken: VSCode.CancellationToken) {
+    const abort = new AbortController();
+    yield* Effect.acquireRelease(Effect.sync(() => requestToken.onCancellationRequested(() => abort.abort())),
+      (cancellation) => Effect.sync(() => { cancellation.dispose(); abort.abort(); }));
+    if (requestToken.isCancellationRequested) abort.abort();
+    const trace = ++requestTrace;
+    let updates = 0;
+    const log = (stage: string) => diagnostic(stage, `handler=${trace} cancelled=${abort.signal.aborted} updates=${updates}`);
+    log("handler.enter");
+    diagnostic("handler.input", `handler=${trace} references=${request.references?.length ?? 0} command=${typeof request.command === "string"} retry=${request.attempt > 0}`);
+
+    return yield* Effect.gen(function* () {
+      if (abort.signal.aborted) {
+        log("handler.cancelled");
+        return {};
+      }
+      if (request.attempt > 0) {
+        throw new Error("Retry is disabled: ACP does not replace completed messages. Open the saved session; if history has not been restored, run Developer: Reload Window and open it again. Send a new message.");
+      }
+      const currentResource = chatContext.chatSessionContext?.chatSessionItem.resource ?? resource;
+      const text = promptText(request);
+      log("record.wait");
+      const current = yield* recordFor(currentResource, text, requestToken);
+      log("record.ready");
+      log("references.check");
+      sessionCommands.validateReferences(request.references ?? [], current);
+      log("references.accepted");
+      // Native edit/Retry can shorten history before invoking us. Never append
+      // that replacement to the unchanged ACP conversation, even via a command.
+      const nativeRequests = (chatContext.history ?? []).filter((turn) => turn instanceof vscode.ChatRequestTurn2);
+      const validateHistory = () => {
+        const previousRequests = current.history.filter((turn) => turn.role === "user");
+        if (previousRequests.some((turn, index) => !nativeRequests[index] || promptText(nativeRequests[index]) !== (turn.nativeText ?? turn.text))) {
+          throw new Error("Editing sent messages is disabled: ACP does not support history rollback. Open the saved session; if history has not been restored, run Developer: Reload Window and open it again. Send a new message.");
+        }
       };
-    },
+      validateHistory();
+      const commandName = /^\/([^\s]+)/.exec(text.trimStart())?.[1];
+      const validateCommand = () => {
+        if (commandName && !current.availableCommands.some((command) => command.name === commandName)) {
+          throw new Error("[OpenCode commands] Command is not advertised by the current session; select an available command");
+        }
+      };
+      const tools = new Map<string, ToolState>();
+      log("prompt.wait");
+      const pending = backend.promptEffect(current, text, abort.signal, (update) => {
+        if (++updates === 1) log("handler.update.first");
+        const part = renderUpdate(vscode, update, tools);
+        if (part instanceof vscode.ChatResponseMarkdownPart) stream.markdown(part.value);
+        else if (part) stream.push(part);
+      }, () => {
+        log("references.recheck");
+        sessionCommands.validateReferences(request.references ?? [], current);
+        validateHistory();
+        validateCommand();
+        log("references.recheck.accepted");
+      }, commandName ? () => Effect.suspend(() => {
+        sessionCommands.validateReferences(request.references ?? [], current);
+        validateCommand();
+        const directories = vscode.workspace.getConfiguration("opencodeNativeChat", vscode.Uri.from({ scheme: "file", path: current.cwd })).get<string[]>("commandTemplateDirectories", []);
+        return expandCommandTemplateEffect(current.cwd, text, { directories, processCwd: backend.options.cwd, environment: current.connection?.environment });
+      }) : undefined, () => Effect.suspend(() => {
+        sessionCommands.validateReferences(request.references ?? [], current);
+        return prepareFileContextEffect(vscode, request.references ?? [], current.connection?.capabilities.embeddedContext, abort.signal);
+      }));
+      sessionOptions.refresh();
+      yield* pending;
+      log("handler.complete");
+      return {};
+    }).pipe(Effect.catchDefect((error) => Effect.fail(error)), Effect.catch((error) => {
+      log("handler.failed");
+      if (abort.signal.aborted) return Effect.succeed({});
+      // VS Code 1.140.0 ignores a session handler's returned ChatResult, but renders thrown errors.
+      return Effect.fail(new Error(`[requestHandler] resource=${resource.toString()}: ${errorMessage(error)}`, { cause: error }));
+    }), Effect.ensuring(Effect.sync(() => {
+      log("handler.cleanup");
+      sessionOptions.refresh();
+    })));
+  }, Effect.scoped, Effect.catchDefect((error) => Effect.fail(error)));
+
+  const provider = {
+    provideChatSessionContent: (resource: VSCode.Uri, token: VSCode.CancellationToken, contentContext?: { inputState?: VSCode.ChatSessionInputState }) => run(contentEffect(resource, token, contentContext)),
   };
   context.subscriptions.push(vscode.chat.registerChatSessionContentProvider(SESSION_TYPE, provider, participant));
 
-  context.subscriptions.push(vscode.commands.registerCommand("opencode.newSession", async () => {
-    const cancellation = new vscode.CancellationTokenSource();
-    try {
-      const item = await create("", cancellation.token);
-      await vscode.commands.executeCommand("vscode.open", item.resource, { preview: false });
+  context.subscriptions.push(vscode.commands.registerCommand("opencode.newSession", () => run(Effect.scoped(Effect.gen(function* () {
+      const cancellation = yield* Effect.acquireRelease(Effect.sync(() => new vscode.CancellationTokenSource()),
+        (cancellation) => Effect.sync(() => cancellation.dispose()));
+      const item = yield* create("", cancellation.token);
+      yield* Effect.tryPromise({ try: async () => vscode.commands.executeCommand("vscode.open", item.resource, { preview: false }), catch: (error) => error });
       // 1.140.0 opens REAL URIs in an editor; the native move closes that tab and preserves the session.
-      await vscode.commands.executeCommand("workbench.action.chat.openInSidebar");
-    } finally {
-      cancellation.dispose();
-    }
-  }));
+      yield* Effect.tryPromise({ try: async () => vscode.commands.executeCommand("workbench.action.chat.openInSidebar"), catch: (error) => error });
+  }).pipe(Effect.catchDefect((error) => Effect.fail(error)))))));
   return controller;
 }
 
-export async function activateWithApi(vscode: EditorApi, context: AdapterContext) {
+const activateEffect = Effect.fnUntraced(function* (vscode: EditorApi, context: AdapterContext) {
   const output = vscode.window.createOutputChannel("OpenCode Native Chat");
   context.subscriptions.push(output);
   const configuration = vscode.workspace.getConfiguration("opencodeNativeChat");
@@ -394,19 +415,23 @@ export async function activateWithApi(vscode: EditorApi, context: AdapterContext
     command: configuration.get("command", "opencode"),
     env: configuration.get<Record<string, string>>("env", {}),
     cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
-    permission: (params, signal) => choosePermission(vscode, params, signal),
+    permission: (params, signal) => choosePermissionEffect(vscode, params, signal),
     onLog: (text) => output.append(text),
   });
 
-  try {
+  return yield* Effect.gen(function* () {
     const controller = register(vscode, context, backend);
     // Registration alone does not populate the VS Code 1.140.0 model cache.
     // Discover only our metadata bridge; this never requests model generation.
-    await vscode.lm.selectChatModels({ vendor: SESSION_TYPE });
+    yield* Effect.tryPromise({ try: async () => vscode.lm.selectChatModels({ vendor: SESSION_TYPE }), catch: (error) => error });
     return controller;
-  } catch (error) {
+  }).pipe(Effect.catchDefect((error) => Effect.fail(error)), Effect.catch((error) => {
     backend.dispose();
     vscode.window.showErrorMessage(`[activate] ${errorMessage(error)}`);
-    throw error;
-  }
+    return Effect.fail(error);
+  }));
+}, Effect.catchDefect((error) => Effect.fail(error)));
+
+export function activateWithApi(vscode: EditorApi, context: AdapterContext) {
+  return Effect.runPromise(activateEffect(vscode, context));
 }

@@ -3,3 +3,4 @@ test/.editor-extensions/
 *.vsix
 node_modules/
 dist/
+.effect-machine/

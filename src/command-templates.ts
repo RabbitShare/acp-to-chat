@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { parse as parseJson, type ParseError } from "jsonc-parser";
 import { parseDocument } from "yaml";
+import { Effect } from "effect";
 import { isObject } from "./protocol";
 
 const LIMIT = 256 * 1024;
@@ -14,28 +15,27 @@ interface TemplateOptions {
 }
 
 // Read only the requested definition, never scan the filesystem or execute a template.
-async function read(file: string): Promise<string | undefined> {
-  let handle;
-  try {
-    handle = await open(file, constants.O_RDONLY | constants.O_NONBLOCK);
-    const stat = await handle.stat();
-    if (!stat.isFile()) throw new Error("not a file");
-    if (stat.size > LIMIT) throw new Error("limit");
-    const buffer = Buffer.alloc(LIMIT + 1);
-    let size = 0;
-    while (size < buffer.length) {
-      const result = await handle.read(buffer, size, buffer.length - size, null);
-      if (!result.bytesRead) break;
-      size += result.bytesRead;
-    }
-    if (size > LIMIT) throw new Error("limit");
-    return new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, size));
-  } catch (error) {
-    if (isObject(error) && ["ENOENT", "ENOTDIR"].includes(String(error.code))) return undefined;
-    // Parser/IO errors can include source content. Never expose their messages.
-    throw new Error("[OpenCode commands] Invalid or unreadable template source (256 KiB limit)");
-  } finally { await handle?.close(); }
-}
+const read = Effect.fnUntraced(function* (file: string) {
+  const handle = yield* Effect.acquireRelease(
+    Effect.tryPromise({ try: () => open(file, constants.O_RDONLY | constants.O_NONBLOCK), catch: (error) => error }),
+    (handle) => Effect.promise(() => handle.close()));
+  const stat = yield* Effect.tryPromise({ try: () => handle.stat(), catch: (error) => error });
+  if (!stat.isFile()) throw new Error("not a file");
+  if (stat.size > LIMIT) throw new Error("limit");
+  const buffer = Buffer.alloc(LIMIT + 1);
+  let size = 0;
+  while (size < buffer.length) {
+    const result = yield* Effect.tryPromise({ try: () => handle.read(buffer, size, buffer.length - size, null), catch: (error) => error });
+    if (!result.bytesRead) break;
+    size += result.bytesRead;
+  }
+  if (size > LIMIT) throw new Error("limit");
+  return new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, size));
+}, Effect.catchDefect((error) => Effect.fail(error)), Effect.catch((error) => {
+  if (isObject(error) && ["ENOENT", "ENOTDIR"].includes(String(error.code))) return Effect.succeed(undefined);
+  // Parser/IO errors can include source content. Never expose their messages.
+  return Effect.fail(new Error("[OpenCode commands] Invalid or unreadable template source (256 KiB limit)"));
+}), Effect.scoped);
 
 function jsonCommand(text: string, name: string): unknown {
   if (Buffer.byteLength(text) > LIMIT) throw new Error("[OpenCode commands] Configuration exceeds 256 KiB limit");
@@ -70,7 +70,7 @@ function markdownCommand(text: string): unknown {
   return { ...metadata, template: body.trim() };
 }
 
-export async function expandCommandTemplate(cwd: string, text: string, options: TemplateOptions = {}): Promise<string> {
+export const expandCommandTemplateEffect = Effect.fnUntraced(function* (cwd: string, text: string, options: TemplateOptions = {}) {
   const invocation = /^\/([^\s]+)(?:\s([\s\S]*))?$/.exec(text.trimStart());
   if (!invocation) return text;
   const [, name, input = ""] = invocation;
@@ -86,33 +86,33 @@ export async function expandCommandTemplate(cwd: string, text: string, options: 
     if (dir === dirname(dir)) break;
   }
   let definition: unknown;
-  const fromJson = async (file: string) => {
-    const content = await read(file);
+  const fromJson = Effect.fnUntraced(function* (file: string) {
+    const content = yield* read(file);
     if (content !== undefined) {
       const value = jsonCommand(content, name);
       if (value !== undefined) definition = value;
     }
-  };
-  const fromDirectory = async (directory: string) => {
-    for (const file of ["opencode.json", "opencode.jsonc"]) await fromJson(join(directory, file));
+  });
+  const fromDirectory = Effect.fnUntraced(function* (directory: string) {
+    for (const file of ["opencode.json", "opencode.jsonc"]) yield* fromJson(join(directory, file));
     for (const subdir of ["command", "commands"]) {
-      const content = await read(join(directory, subdir, `${name}.md`));
+      const content = yield* read(join(directory, subdir, `${name}.md`));
       if (content !== undefined) definition = markdownCommand(content);
     }
-  };
+  });
   // Mirrors OpenCode V2's local configuration entry order. No remote/plugin definitions.
   // https://github.com/anomalyco/opencode/blob/v2.0.21/packages/core/src/config.ts
   // https://github.com/anomalyco/opencode/blob/v2.0.21/packages/core/src/config/discovery.ts
-  await fromDirectory(global);
-  if (environment.OPENCODE_CONFIG) await fromJson(resolve(options.processCwd ?? process.cwd(), environment.OPENCODE_CONFIG));
+  yield* fromDirectory(global);
+  if (environment.OPENCODE_CONFIG) yield* fromJson(resolve(options.processCwd ?? process.cwd(), environment.OPENCODE_CONFIG));
   if (resolve(cwd) !== resolve(global)) {
     for (const dir of ancestors) {
       if (resolve(dir) === resolve(global)) continue;
-      for (const file of ["opencode.json", "opencode.jsonc"]) await fromJson(join(dir, file));
+      for (const file of ["opencode.json", "opencode.jsonc"]) yield* fromJson(join(dir, file));
     }
     for (const dir of ancestors) {
       const project = join(dir, ".opencode");
-      if (resolve(project) !== resolve(global)) await fromDirectory(project);
+      if (resolve(project) !== resolve(global)) yield* fromDirectory(project);
     }
   }
   if (environment.OPENCODE_CONFIG_CONTENT) {
@@ -125,7 +125,7 @@ export async function expandCommandTemplate(cwd: string, text: string, options: 
     if (options.directories !== undefined && !Array.isArray(options.directories)) throw new Error("[OpenCode commands] Invalid template directories");
     for (const directory of new Set(options.directories ?? [])) {
       if (typeof directory !== "string" || !directory) throw new Error("[OpenCode commands] Invalid template directory");
-      const content = await read(join(isAbsolute(directory) ? directory : resolve(cwd, directory), `${name}.md`));
+      const content = yield* read(join(isAbsolute(directory) ? directory : resolve(cwd, directory), `${name}.md`));
       if (content !== undefined) matches.push(content);
     }
     if (matches.length > 1) throw new Error("[OpenCode commands] Ambiguous local template sources");
@@ -178,4 +178,8 @@ export async function expandCommandTemplate(cwd: string, text: string, options: 
   if (!expanded) throw new Error("[OpenCode commands] Empty expanded template");
   if (expanded.startsWith("/")) throw new Error("[OpenCode commands] Unsupported template beginning with slash; it could execute another command");
   return expanded;
+}, Effect.catchDefect((error) => Effect.fail(error instanceof Error ? error : new Error("[OpenCode commands] Invalid template source"))));
+
+export function expandCommandTemplate(cwd: string, text: string, options: TemplateOptions = {}): Promise<string> {
+  return Effect.runPromise(expandCommandTemplateEffect(cwd, text, options));
 }

@@ -487,6 +487,21 @@ test("inline eager New cwd cancellation creates nothing", async (t) => {
   assert.equal(editor.data.has("sessions"), false);
 });
 
+test("native draft materialization retains a non-Error editor rejection as the handler cause", async (t) => {
+  const editor = configured(t, "commands", async () => "no", [__dirname, path.dirname(__dirname)]);
+  const failure = { message: "workspace picker rejected" };
+  editor.vscode.window.showWorkspaceFolderPick = async () => { throw failure; };
+  const resource = editor.vscode.Uri.from({ scheme: "opencode", path: "/untitled-picker-failure" });
+  const session = await editor.vscode.provider.provideChatSessionContent(resource, token);
+  await assert.rejects(session.requestHandler({ prompt: "check", attempt: 0 }, { history: [] },
+    { markdown() {}, push() {} }, token), (error) => {
+    assert.equal(error.message, `[requestHandler] resource=${resource.toString()}: workspace picker rejected`);
+    assert.equal(error.cause, failure);
+    return true;
+  });
+  assert.equal(editor.backend.client, undefined);
+});
+
 test("inline eager New uses one multi-root cwd choice", async (t) => {
   const editor = configured(t, "config", undefined, [__dirname, path.join(__dirname, "fixtures")]);
   const { backend } = editor;
@@ -1390,6 +1405,58 @@ test("dynamic slash customizations follow materialized untitled aliases without 
   assert.deepEqual((await traffic(editor.backend, "session/prompt"))[0].params.prompt, [{ type: "text", text: "Fixture review keep  literal" }]);
 });
 
+test("untitled materialization joins persistence failure then permits one fresh retry", { timeout: 5000 }, async (t) => {
+  const editor = configured(t, "commands");
+  const resource = editor.vscode.Uri.from({ scheme: "opencode", path: "/untitled-joined-write" });
+  const session = await editor.vscode.provider.provideChatSessionContent(resource, token);
+  let entered, rejectWrite;
+  const writing = new Promise((resolve) => { entered = resolve; });
+  const failure = new Error("metadata write failed");
+  const original = editor.context.workspaceState.update;
+  editor.context.workspaceState.update = () => { entered(); return new Promise((_resolve, reject) => { rejectWrite = reject; }); };
+  const send = () => session.requestHandler({ prompt: "check", attempt: 0 }, { history: [] }, { markdown() {}, push() {} }, token);
+  const first = assert.rejects(send(), (error) => error.cause === failure);
+  await writing;
+  const second = assert.rejects(send(), (error) => error.cause === failure);
+  rejectWrite(failure);
+  await Promise.all([first, second]);
+  assert.equal((await traffic(editor.backend, "session/new")).length, 1);
+  assert.equal((await traffic(editor.backend, "session/prompt")).length, 0);
+  editor.context.workspaceState.update = original;
+  await send();
+  assert.equal((await traffic(editor.backend, "session/new")).length, 2);
+  assert.equal((await traffic(editor.backend, "session/prompt")).length, 1);
+});
+
+test("metadata writer retains snapshot order and reports only the failed operation", { timeout: 5000 }, async (t) => {
+  const editor = configured(t, "commands");
+  const { record } = await emptySession(editor);
+  const calls = [];
+  const started = Array.from({ length: 3 }, () => {
+    let resolve;
+    const promise = new Promise((done) => { resolve = done; });
+    return { promise, resolve };
+  });
+  editor.context.workspaceState.update = (_key, snapshot) => new Promise((resolve, reject) => {
+    calls.push({ snapshot, resolve, reject });
+    started[calls.length - 1].resolve();
+  });
+  for (const label of ["first", "second", "third"]) {
+    record.label = label;
+    editor.backend.emit("status", record, "completed");
+  }
+  assert.equal(calls.length, 1, "Only one metadata write runs at a time");
+  calls[0].reject(new Error("first write failed"));
+  await started[1].promise;
+  assert.equal(calls.length, 2);
+  calls[1].resolve();
+  await started[2].promise;
+  calls[2].resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls.map((call) => call.snapshot[0].label), ["first", "second", "third"]);
+  assert.deepEqual(editor.errors, [`[remember] sessionId=${record.id}: first write failed`]);
+});
+
 test("dynamic slash expands the local template and keeps arguments literal with virtual prompt references", async (t) => {
   const editor = configured(t, "commands");
   const item = await editor.controller.newChatSessionItemHandler({ request: { prompt: "" } }, token);
@@ -1497,6 +1564,46 @@ test("file context sends only an explicitly attached selection", async (t) => {
     { history: [] }, { markdown() {}, push() {} }, token);
   assert.deepEqual((await traffic(editor.backend, "session/prompt"))[0].params.prompt, [{ type: "text", text: "check" },
     { type: "resource", resource: { uri: uri.with({ fragment: "L2-L2" }).toString(), mimeType: "text/plain", text: "selected" } }]);
+});
+
+test("file context Effect interruption during stat never opens the document", async () => {
+  const { Effect, Fiber } = await import("effect");
+  const { vscode } = api();
+  const uri = vscode.Uri.from({ scheme: "file", path: "/held.txt" });
+  let entered, release;
+  const statEntered = new Promise((resolve) => { entered = resolve; });
+  const stat = new Promise((resolve) => { release = resolve; });
+  let opened = 0;
+  vscode.workspace.fs.stat = () => { entered(); return stat; };
+  vscode.workspace.openTextDocument = async () => { opened++; return textDocument(vscode, uri, "text"); };
+  const fiber = Effect.runFork(extension.prepareFileContextEffect(vscode, [{ id: uri.toString(), value: uri }], true, new AbortController().signal));
+  await statEntered;
+  await Effect.runPromise(Fiber.interrupt(fiber));
+  release({ size: 4 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(opened, 0);
+});
+
+test("native lock projection failure cannot strand a synchronously reserved turn", { timeout: 5000 }, async (t) => {
+  const editor = configured(t, "commands");
+  const { session, record, state } = await emptySession(editor);
+  const cleanup = new Promise((resolve) => {
+    const listener = (current) => {
+      if (current === record && !record.turn) { editor.backend.off("status", listener); resolve(); }
+    };
+    editor.backend.on("status", listener);
+    t.after(() => editor.backend.off("status", listener));
+  });
+  const groups = Object.getOwnPropertyDescriptor(state, "groups");
+  Object.defineProperty(state, "groups", { get: groups.get, set(value) {
+    if (record.turn) throw new Error("host lock failed");
+    groups.set.call(this, value);
+  } });
+  await assert.rejects(session.requestHandler({ prompt: "check", attempt: 0 }, { history: [] },
+    { markdown() {}, push() {} }, token), /host lock failed/);
+  await cleanup;
+  assert.equal(record.turn, undefined);
+  assert.equal((await traffic(editor.backend, "session/cancel")).length, 0);
 });
 
 for (const failure of ["unsupported", "malformed", "unreadable", "binary", "size", "combined-size", "count", "range", "scheme"]) test(`file context rejects ${failure} without history or ACP prompt`, async (t) => {
@@ -1968,10 +2075,48 @@ test("permission picker dismissal returns no approval", async () => {
   assert.equal(await answer, undefined);
 });
 
+test("permission picker releases resources when native show throws", async () => {
+  const { vscode } = api();
+  const released = [];
+  const failure = new Error("picker show failed");
+  vscode.window.createQuickPick = () => ({
+    selectedItems: [], show() { throw failure; },
+    dispose() { released.push("picker"); },
+    onDidAccept: () => ({ dispose() { released.push("accept"); } }),
+    onDidHide: () => ({ dispose() { released.push("hide"); } }),
+  });
+  await assert.rejects(extension.choosePermission(vscode, {
+    sessionId: "1", toolCall: { toolCallId: "tool" }, options: [],
+  }, new AbortController().signal), (error) => error === failure);
+  assert.deepEqual(released.sort(), ["accept", "hide", "picker"]);
+});
+
+test("permission Effect interruption closes picker and ignores late acceptance", async () => {
+  assert.equal(typeof extension.choosePermissionEffect, "function");
+  const { Effect, Fiber } = await import("effect");
+  const { vscode } = api();
+  let accept;
+  const released = [];
+  vscode.window.createQuickPick = () => ({
+    selectedItems: [{ optionId: "allow" }], show() {},
+    dispose() { released.push("picker"); },
+    onDidAccept: (listener) => { accept = listener; return { dispose() { released.push("accept"); } }; },
+    onDidHide: () => ({ dispose() { released.push("hide"); } }),
+  });
+  const fiber = Effect.runFork(extension.choosePermissionEffect(vscode, {
+    sessionId: "1", toolCall: { toolCallId: "tool" },
+    options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+  }, new AbortController().signal));
+  await Effect.runPromise(Fiber.interrupt(fiber));
+  assert.deepEqual(released.sort(), ["accept", "hide", "picker"]);
+  accept();
+});
+
 test("permission cancellation cannot return a selected approval", async () => {
   const { vscode } = api();
+  let disposed = false;
   const picker = {
-    selectedItems: [{ optionId: "allow" }], show() {}, dispose() {},
+    selectedItems: [{ optionId: "allow" }], show() {}, dispose() { disposed = true; },
     onDidAccept: () => ({ dispose() {} }), onDidHide: () => ({ dispose() {} }),
   };
   vscode.window.createQuickPick = () => picker;
@@ -1981,6 +2126,7 @@ test("permission cancellation cannot return a selected approval", async () => {
     options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
   }, controller.signal);
   controller.abort();
+  assert.equal(disposed, true, "Stop closes the picker before returning");
   assert.equal(await answer, undefined);
 });
 

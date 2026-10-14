@@ -127,6 +127,28 @@ test("local templates leave ordinary non-command text unchanged", async (t) => {
   assert.equal(await w.expand('ordinary /review text'), 'ordinary /review text');
 });
 
+test("template Effect interruption waits for acquired handle and closes it without reading", async (t) => {
+  const extension = require("../dist/extension");
+  assert.equal(typeof extension.expandCommandTemplateEffect, "function");
+  const { Effect, Fiber } = await import("effect");
+  const promises = require("node:fs/promises");
+  const original = promises.open;
+  t.after(() => { promises.open = original; });
+  let opened;
+  const entered = new Promise((resolve) => { opened = resolve; });
+  let acquire;
+  let closed = 0;
+  let reads = 0;
+  promises.open = () => { opened(); return new Promise((resolve) => { acquire = resolve; }); };
+  const fiber = Effect.runFork(extension.expandCommandTemplateEffect(__dirname, "/review", { environment: { OPENCODE_CONFIG_DIR: __dirname } }));
+  await entered;
+  const interrupted = Effect.runPromise(Fiber.interrupt(fiber));
+  acquire({ close: async () => { closed++; }, stat: async () => { reads++; return { isFile: () => true, size: 0 }; } });
+  await interrupted;
+  assert.equal(closed, 1);
+  assert.equal(reads, 0);
+});
+
 test("local templates reject traversal in command names", async (t) => {
   const w = workspace(t);
   await assert.rejects(w.expand('/../outside'), /Invalid command name/);

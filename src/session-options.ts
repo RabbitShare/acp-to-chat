@@ -1,6 +1,8 @@
 import type * as VSCode from "vscode";
 import { Sessions, type SessionRecord } from "./sessions";
 import { errorMessage } from "./protocol";
+import { Effect } from "effect";
+import type { NativeRunner } from "./extension";
 
 type Group = VSCode.ChatSessionProviderOptionGroup;
 type State = VSCode.ChatSessionInputState;
@@ -31,8 +33,9 @@ const choiceFor = (value: string, revision: number) => `v_${encode(value)}_${rev
 export function registerSessionOptions(
   controller: VSCode.ChatSessionItemController,
   backend: Sessions,
-  load: (resource: VSCode.Uri, token: VSCode.CancellationToken) => Promise<SessionRecord>,
+  load: (resource: VSCode.Uri, token: VSCode.CancellationToken) => Promise<SessionRecord> | Effect.Effect<SessionRecord, unknown>,
   showError: (message: string) => unknown,
+  run: NativeRunner = Effect.runPromise,
 ) {
   const bindings = new Map<string, Binding>();
   const managed = new Map<State, ManagedState>();
@@ -133,20 +136,23 @@ export function registerSessionOptions(
         return;
       }
       pendingSelections.set(record, { groupId, itemId });
-      void backend.setConfigOption(record, id, choice.value, entry.revision ?? record.configRevision)
-        .catch((error: unknown) => { showError(`[OpenCode configuration] sessionId=${record.id}: ${errorMessage(error)}`); })
-        .finally(() => {
+      // Reserve before running an effect: same-stack Send must observe this setter.
+      const accepted = backend.setConfigOption(record, id, choice.value, entry.revision ?? record.configRevision);
+      void run(Effect.tryPromise({ try: () => accepted, catch: (error) => error }).pipe(
+        Effect.catch((error) => Effect.sync(() => { showError(`[OpenCode configuration] sessionId=${record.id}: ${errorMessage(error)}`); })),
+        Effect.ensuring(Effect.sync(() => {
           pendingSelections.delete(record);
           refresh();
-        });
+        })))).catch(() => { /* Application-scope interruption is normal during disposal. */ });
       return;
     }
   }
 
-  controller.getChatSessionInputState = async (resource, _context, token) => {
+  const inputState = Effect.fnUntraced(function* (resource: VSCode.Uri | undefined, token: VSCode.CancellationToken) {
     let binding: Binding | undefined;
     if (resource && !resource.path.startsWith("/untitled-")) {
-      const record = await load(resource, token);
+      const resolution = load(resource, token);
+      const record = yield* Effect.isEffect(resolution) ? resolution : Effect.tryPromise({ try: () => resolution, catch: (error) => error });
       const key = resource.toString();
       binding = bindings.get(key) ?? { resource: key, record };
       bindings.set(key, binding);
@@ -163,7 +169,8 @@ export function registerSessionOptions(
       refresh();
     }));
     return state;
-  };
+  }, Effect.catchDefect((error) => Effect.fail(error)));
+  controller.getChatSessionInputState = (resource, _context, token) => run(inputState(resource, token));
 
   backend.on("config", refresh);
   return {

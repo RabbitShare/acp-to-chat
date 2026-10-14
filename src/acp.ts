@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
+import { Deferred, Effect, Fiber } from "effect";
 import {
   client, ndJsonStream, RequestError,
   type AgentRequestMethod, type AgentRequestParamsByMethod, type AgentRequestResponsesByMethod,
@@ -9,7 +10,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import { errorMessage, isObject } from "./protocol";
 
-interface ClientOptions {
+export interface ClientOptions {
   cwd?: string;
   env?: Record<string, string>;
   onRequest?: (method: string, params: unknown) => RequestPermissionResponse | Promise<RequestPermissionResponse>;
@@ -24,6 +25,8 @@ export class AcpClient extends EventEmitter<{ notification: [method: string, par
   child: ChildProcessWithoutNullStreams;
   readonly environment: NodeJS.ProcessEnv;
   private connection: ClientConnection;
+  private childClosed = false;
+  private disposal?: Fiber.Fiber<void>;
   failure?: Error;
   disposing = false;
   capabilities: { loadSession?: boolean; embeddedContext?: boolean } = {};
@@ -40,7 +43,10 @@ export class AcpClient extends EventEmitter<{ notification: [method: string, par
     this.child.stdin.on("error", (error) => this.fail(new Error(`[AcpClient.write] ${error.message}`)));
     this.child.stdout.on("error", (error) => this.fail(new Error(`[AcpClient.receive] ${error.message}`)));
     this.child.on("error", (error) => this.fail(new Error(`[AcpClient.spawn] command=${command} cwd=${cwd}: ${error.message}`)));
-    this.child.on("close", (code, signal) => this.fail(new Error(`[AcpClient.exit] code=${code} signal=${signal}`)));
+    this.child.on("close", (code, signal) => {
+      this.childClosed = true;
+      this.fail(new Error(`[AcpClient.exit] code=${code} signal=${signal}`));
+    });
 
     const output = Writable.toWeb(this.child.stdin);
     const guardedOutput = new WritableStream<Uint8Array>({
@@ -59,12 +65,13 @@ export class AcpClient extends EventEmitter<{ notification: [method: string, par
           this.fail(error);
           throw error;
         }
-        const writer = output.getWriter();
-        try {
-          await writer.write(bytes);
-        } finally {
-          writer.releaseLock();
-        }
+        await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+          const writer = yield* Effect.acquireRelease(
+            Effect.sync(() => output.getWriter()),
+            (writer) => Effect.sync(() => writer.releaseLock()),
+          );
+          yield* Effect.promise(() => writer.write(bytes));
+        })));
       },
     });
     // Node's Web Streams declaration makes a done result's value optional;
@@ -84,15 +91,7 @@ export class AcpClient extends EventEmitter<{ notification: [method: string, par
         if (this.child.exitCode !== null || this.child.signalCode !== null) return;
         // Stdio EOF precedes child close. Briefly wait for exit context, but an
         // agent that closes stdout while alive must still fail without a deadline.
-        await new Promise<void>((resolve) => {
-          const done = () => {
-            clearTimeout(timer);
-            this.child.off("close", done);
-            resolve();
-          };
-          const timer = setTimeout(done, 100);
-          this.child.once("close", done);
-        });
+        await Effect.runPromise(Effect.raceFirst(this.awaitChildClose(), Effect.sleep(100)));
       },
     }));
     const handleRequest = async (method: string, params: unknown) => {
@@ -123,39 +122,76 @@ export class AcpClient extends EventEmitter<{ notification: [method: string, par
   }
 
   request<Method extends AgentRequestMethod>(method: Method, params: AgentRequestParamsByMethod[Method], timeout = 30000): Promise<AgentRequestResponsesByMethod[Method]> {
+    return Effect.runPromise(this.requestEffect(method, params, timeout));
+  }
+
+  requestEffect<Method extends AgentRequestMethod>(method: Method, params: AgentRequestParamsByMethod[Method], timeout = 30000): Effect.Effect<AgentRequestResponsesByMethod[Method], Error> {
     return this.withDeadline(method, timeout, () => this.connection.agent.request(method, params));
   }
 
   requestExtension(method: FixtureMethod, params: unknown, timeout = 30000): Promise<unknown> {
+    return Effect.runPromise(this.requestExtensionEffect(method, params, timeout));
+  }
+
+  requestExtensionEffect(method: FixtureMethod, params: unknown, timeout = 30000): Effect.Effect<unknown, Error> {
     return this.withDeadline(method, timeout, () => this.connection.agent.request(method, params));
   }
 
-  private async withDeadline<Response>(method: string, timeout: number, send: () => Promise<Response>): Promise<Response> {
-    if (this.failure) throw this.failure;
-    const timer = timeout > 0 ? setTimeout(() => {
-      // SDK cancellationSignal is cooperative, not force-settling. Closing the
-      // shared connection settles all SDK pending requests and all its sessions.
-      this.fail(new Error(`[AcpClient.request] method=${method} timed out after ${timeout}ms`));
-    }, timeout) : undefined;
-    try {
-      return await send();
-    } catch (error) {
-      const code = error instanceof RequestError ? ` code=${error.code}` : "";
-      throw new Error(`[AcpClient.request] method=${method}${code}: ${errorMessage(this.failure ?? error)}`);
-    } finally {
-      clearTimeout(timer);
-    }
+  private withDeadline<Response>(method: string, timeout: number, send: () => Promise<Response>): Effect.Effect<Response, Error> {
+    const self = this;
+    // Interrupting an SDK-awaiting fiber is not cancellation. Only shared close
+    // settles the SDK promise; retain its await until a response or that close.
+    return Effect.uninterruptible(Effect.scoped(Effect.gen(function* () {
+      if (self.failure) return yield* Effect.fail(self.failure);
+      if (timeout > 0) {
+        yield* sleep(timeout).pipe(
+          Effect.andThen(Effect.sync(() => self.fail(new Error(`[AcpClient.request] method=${method} timed out after ${timeout}ms`)))),
+          Effect.interruptible,
+          Effect.forkScoped,
+        );
+      }
+      return yield* Effect.tryPromise({
+        try: send,
+        catch: (error) => {
+          const code = error instanceof RequestError ? ` code=${error.code}` : "";
+          return new Error(`[AcpClient.request] method=${method}${code}: ${errorMessage(self.failure ?? error)}`);
+        },
+      });
+    })));
   }
 
-  async notify<Method extends AgentNotificationMethod>(method: Method, params: AgentNotificationParamsByMethod[Method]): Promise<void> {
-    if (this.failure) throw this.failure;
-    try {
-      await this.connection.agent.notify(method, params);
-    } catch (error) {
-      const failure = new Error(`[AcpClient.write] method=${method}: ${errorMessage(error)}`);
-      this.fail(failure);
-      throw this.failure ?? failure;
-    }
+  notify<Method extends AgentNotificationMethod>(method: Method, params: AgentNotificationParamsByMethod[Method]): Promise<void> {
+    return Effect.runPromise(this.notifyEffect(method, params));
+  }
+
+  notifyEffect<Method extends AgentNotificationMethod>(method: Method, params: AgentNotificationParamsByMethod[Method]): Effect.Effect<void, Error> {
+    return Effect.uninterruptible(Effect.suspend(() => {
+      if (this.failure) return Effect.fail(this.failure);
+      return Effect.tryPromise({
+        try: () => new Promise<void>((resolve, reject) => {
+          // SDK notification awaits its write queue, not pendingResponses. A
+          // blocked writer must still settle when the shared connection closes.
+          const signal = this.connection.signal;
+          const failed = (error: unknown) => {
+            signal.removeEventListener("abort", close);
+            reject(error);
+          };
+          const close = () => failed(signal.reason);
+          signal.addEventListener("abort", close, { once: true });
+          if (signal.aborted) { close(); return; }
+          try { void this.connection.agent.notify(method, params).then(() => {
+            signal.removeEventListener("abort", close);
+            resolve();
+          }, failed); }
+          catch (error) { failed(error); }
+        }),
+        catch: (error) => {
+          const failure = new Error(`[AcpClient.write] method=${method}: ${errorMessage(error)}`);
+          this.fail(failure);
+          return this.failure ?? failure;
+        },
+      });
+    }));
   }
 
   fail(error: Error) {
@@ -172,14 +208,48 @@ export class AcpClient extends EventEmitter<{ notification: [method: string, par
     this.fail(new Error("[AcpClient.dispose] Connection closed"));
     this.connection.close(this.failure);
     this.child.stdin.end();
-    if (this.child.exitCode !== null || this.child.signalCode !== null) return;
-    const terminate = setTimeout(() => this.child.kill("SIGTERM"), 2000);
-    const force = setTimeout(() => this.child.kill("SIGKILL"), 3000);
-    terminate.unref();
-    force.unref();
-    this.child.once("close", () => {
-      clearTimeout(terminate);
-      clearTimeout(force);
+    const self = this;
+    this.disposal = Effect.runFork(Effect.scoped(Effect.gen(function* () {
+      if (self.child.exitCode === null && self.child.signalCode === null) {
+        yield* sleep(2000, { unref: true }).pipe(Effect.andThen(Effect.sync(() => { self.child.kill("SIGTERM"); })), Effect.forkScoped);
+        yield* sleep(3000, { unref: true }).pipe(Effect.andThen(Effect.sync(() => { self.child.kill("SIGKILL"); })), Effect.forkScoped);
+      }
+      yield* self.awaitChildClose();
+    })));
+  }
+
+  /** Joins physical cleanup; the synchronous facade still reserves disposal immediately. */
+  disposeEffect(): Effect.Effect<void> {
+    return Effect.uninterruptible(Effect.suspend(() => {
+      this.dispose();
+      return this.disposal ? Fiber.join(this.disposal) : Effect.void;
+    }));
+  }
+
+  private awaitChildClose(): Effect.Effect<void> {
+    return Effect.callback((resume) => {
+      if (this.childClosed) {
+        resume(Effect.void);
+        return;
+      }
+      const done = () => resume(Effect.void);
+      this.child.once("close", done);
+      return Effect.sync(() => this.child.off("close", done));
     });
   }
 }
+
+// Scope clears the handle on success as well as interruption (including an
+// injected deadline callback). Node's unref preserves idle-extension shutdown.
+const sleep = Effect.fnUntraced(function* (milliseconds: number, options: { unref?: boolean } = {}) {
+  const elapsed = yield* Deferred.make<void>();
+  yield* Effect.acquireRelease(
+    Effect.sync(() => {
+      const timer = setTimeout(() => Deferred.doneUnsafe(elapsed, Effect.void), milliseconds);
+      if (options.unref) timer.unref();
+      return timer;
+    }),
+    (timer) => Effect.sync(() => clearTimeout(timer)),
+  );
+  yield* Deferred.await(elapsed);
+}, Effect.scoped);

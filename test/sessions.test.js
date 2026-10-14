@@ -15,6 +15,251 @@ function sessions(t, permission = async () => "no", scenario) {
   return backend;
 }
 
+test("terminal Sessions disposal rejects reconnect, load, create and prompt without launch", async (t) => {
+  const backend = sessions(t);
+  const record = await backend.create(__dirname);
+  const client = backend.client;
+  backend.dispose();
+  await assert.rejects(backend.connect(), /disposed|closed/i);
+  await assert.rejects(backend.create(__dirname), /disposed|closed/i);
+  await assert.rejects(backend.load(record), /disposed|closed/i);
+  await assert.rejects(backend.prompt(record, "never", new AbortController().signal, () => {}), /disposed|closed/i);
+  assert.equal(backend.client, undefined);
+  assert.equal(backend.records.size, 1);
+  assert.deepEqual(record.history, []);
+  assert.equal(client.disposing, true);
+});
+
+test("terminal disposal during lazy startup settles joined callers and joins bounded child cleanup", async (t) => {
+  const { Effect } = require("effect");
+  const backend = sessions(t);
+  const first = backend.connect();
+  const second = backend.connect();
+  const rejected = [first, second].map((promise) => promise.then(() => undefined, (error) => error));
+  backend.dispose();
+  const errors = await Promise.all(rejected);
+  assert.match(errors[0].message, /disposed|closed/i);
+  assert.equal(errors[0], errors[1]);
+  await Effect.runPromise(backend.disposeEffect());
+  assert.equal(backend.client, undefined);
+  assert.equal(backend.ready, undefined);
+  await assert.rejects(backend.connect(), /disposed/i);
+});
+
+test("Stop leaves shared load owned by session and joined callers receive one failure", { timeout: 3000 }, async (t) => {
+  const backend = sessions(t, undefined, "load-delayed-error");
+  const client = await backend.connect();
+  let entered;
+  const loading = new Promise((resolve) => { entered = resolve; });
+  client.on("notification", (method, params) => { if (params._meta?.fixture === "load_pending") entered(); });
+  const saved = { id: "saved", cwd: __dirname };
+  const first = backend.load(saved);
+  const second = backend.load(saved);
+  const failures = [first, second].map((promise) => promise.then(() => undefined, (error) => error));
+  await loading;
+  const record = backend.records.get(saved.id);
+  const stop = new AbortController();
+  const send = backend.prompt(record, "never", stop.signal, () => {});
+  stop.abort();
+  assert.equal((await Promise.race([send, new Promise((_, reject) => setTimeout(() => reject(new Error("Stop waited for session load")), 200))])).stopReason, "cancelled");
+  assert.ok(record.loading);
+  assert.deepEqual(record.history, []);
+  await client.requestExtension("echo", { control: "release-load" });
+  const [a, b] = await Promise.all(failures);
+  assert.match(a.message, /joined load failed/);
+  assert.equal(a, b);
+  assert.equal(record.loading, undefined);
+  const traffic = await configTraffic(backend);
+  assert.equal(traffic.filter((entry) => entry.method === "session/load").length, 1);
+  assert.equal(traffic.some((entry) => ["session/prompt", "session/cancel"].includes(entry.method)), false);
+});
+
+test("independent permissions within same turn keep needsInput until last picker settles", async (t) => {
+  const releases = [];
+  let opened, openedSecond;
+  const firstOpened = new Promise((resolve) => { opened = resolve; });
+  const secondOpened = new Promise((resolve) => { openedSecond = resolve; });
+  const backend = sessions(t, () => new Promise((resolve) => { releases.push(resolve); opened(); if (releases.length === 2) openedSecond(); }));
+  t.after(() => releases.forEach((release) => release(undefined)));
+  const record = await backend.create(__dirname);
+  const statuses = [];
+  backend.on("status", (_, status) => statuses.push(status));
+  const send = backend.prompt(record, "question", new AbortController().signal, () => {});
+  await firstOpened;
+  const extra = backend.requestPermission("session/request_permission", { sessionId: record.id,
+    toolCall: { toolCallId: "independent", title: "Independent" }, options: [{ optionId: "yes", name: "Allow", kind: "allow_once" }] });
+  await secondOpened;
+  assert.equal(releases.length, 2);
+  releases[1]("yes");
+  assert.deepEqual(await extra, { outcome: { outcome: "selected", optionId: "yes" } });
+  assert.equal(statuses.at(-1), "needsInput");
+  releases[0]("no");
+  await send;
+  assert.equal(statuses.at(-1), "completed");
+});
+
+test("hung cancel write still closes shared transport at five seconds and settles turn", { timeout: 3000 }, async (t) => {
+  const { Effect } = require("effect");
+  let expire, entered, opened, releaseWrite;
+  const writing = new Promise((resolve) => { entered = resolve; });
+  const permission = new Promise((resolve) => { opened = resolve; });
+  const heldWrite = new Promise((resolve) => { releaseWrite = resolve; });
+  t.after(() => releaseWrite());
+  const schedule = global.setTimeout;
+  t.mock.method(global, "setTimeout", (callback, delay, ...args) => {
+    if (delay === 5000) expire = callback;
+    return schedule(callback, delay, ...args);
+  });
+  const toWeb = Writable.toWeb;
+  t.mock.method(Writable, "toWeb", (...args) => {
+    const output = toWeb(...args);
+    return new WritableStream({ write: async (bytes) => {
+      if (new TextDecoder().decode(bytes).includes('"method":"session/cancel"')) { entered(); await heldWrite; return; }
+      const writer = output.getWriter();
+      try { await writer.write(bytes); } finally { writer.releaseLock(); }
+    } });
+  });
+  const backend = sessions(t, async (_, signal) => {
+    opened();
+    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+    return "yes";
+  });
+  const record = await backend.create(__dirname);
+  const client = backend.client;
+  const stop = new AbortController();
+  const send = backend.prompt(record, "question", stop.signal, () => {});
+  await permission;
+  stop.abort();
+  await writing;
+  expire();
+  assert.equal((await Promise.race([send, new Promise((_, reject) => schedule(() => reject(new Error("cancel await blocked shared close")), 200))])).stopReason, "cancelled");
+  assert.ok(client.failure);
+  assert.equal(record.turn, undefined);
+  await Effect.runPromise(backend.disposeEffect());
+});
+
+test("Stop synchronously inside final guard has no history or prompt RPC", async (t) => {
+  const backend = sessions(t);
+  const record = await backend.create(__dirname);
+  const stop = new AbortController();
+  const result = await backend.prompt(record, "never", stop.signal, () => {}, () => stop.abort());
+  assert.equal(result.stopReason, "cancelled");
+  assert.deepEqual(record.history, []);
+  assert.equal((await configTraffic(backend)).some((entry) => ["session/prompt", "session/cancel"].includes(entry.method)), false);
+});
+
+test("same-stack Send reserves turn before a competing configuration setter", async (t) => {
+  const backend = sessions(t, undefined, "config");
+  const record = await backend.create(__dirname);
+  const stop = new AbortController();
+  const send = backend.prompt(record, "never", stop.signal, () => {});
+  assert.ok(record.turn);
+  const setter = assert.rejects(backend.setConfigOption(record, "mode", "custom-agent", record.configRevision), /already active/);
+  stop.abort();
+  await setter;
+  assert.equal((await send).stopReason, "cancelled");
+  assert.deepEqual(record.history, []);
+  assert.equal(record.configPending, undefined);
+  assert.equal((await configTraffic(backend)).some((entry) => ["session/set_config_option", "session/prompt", "session/cancel"].includes(entry.method)), false);
+});
+
+test("same-turn concurrent ACP permissions both close on Stop and cannot approve late choices", async (t) => {
+  const signals = [];
+  let opened;
+  const bothOpened = new Promise((resolve) => { opened = resolve; });
+  const backend = sessions(t, async (_, signal) => {
+    signals.push(signal);
+    if (signals.length === 2) opened();
+    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+    return "yes";
+  }, "concurrent-permissions");
+  const record = await backend.create(__dirname);
+  const stop = new AbortController();
+  const send = backend.prompt(record, "question", stop.signal, () => {});
+  await bothOpened;
+  stop.abort();
+  const result = await send;
+  assert.equal(result.stopReason, "cancelled");
+  assert.deepEqual(result._meta.permissions, [{ outcome: { outcome: "cancelled" } }, { outcome: { outcome: "cancelled" } }]);
+  assert.ok(signals.every((signal) => signal.aborted));
+  assert.equal(record.turn, undefined);
+  assert.equal((await configTraffic(backend)).filter((entry) => entry.method === "session/cancel").length, 1);
+});
+
+test("late permission from cancelled turn cannot approve replacement turn", { timeout: 3000 }, async (t) => {
+  const releases = [];
+  const opened = [];
+  const backend = sessions(t, () => new Promise((resolve) => {
+    releases.push(resolve);
+    opened.push(undefined);
+  }));
+  const record = await backend.create(__dirname);
+  const firstStop = new AbortController();
+  const first = backend.prompt(record, "first", firstStop.signal, () => {});
+  await new Promise((resolve) => {
+    const check = () => opened.length === 1 ? resolve() : setImmediate(check);
+    check();
+  });
+  firstStop.abort();
+  await first;
+
+  const second = backend.prompt(record, "second", new AbortController().signal, () => {});
+  await new Promise((resolve) => {
+    const check = () => opened.length === 2 ? resolve() : setImmediate(check);
+    check();
+  });
+  releases[0]("yes");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(record.history.filter((turn) => turn.role === "user").at(-1).text, "second");
+  releases[1]("no");
+  await second;
+});
+
+test("queued permission cancellation cannot overtake pending machine cancel write", async (t) => {
+  const { Deferred, Effect } = require("effect");
+  let opened, enteredCancel;
+  let pickers = 0;
+  const permissionOpened = new Promise((resolve) => { opened = resolve; });
+  const cancelStarted = new Promise((resolve) => { enteredCancel = resolve; });
+  const write = Deferred.makeUnsafe();
+  t.after(() => Deferred.doneUnsafe(write, Effect.void));
+  const backend = sessions(t, async (_, signal) => {
+    pickers++;
+    opened();
+    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+    return undefined;
+  });
+  const record = await backend.create(__dirname);
+  const notify = backend.client.notifyEffect.bind(backend.client);
+  t.mock.method(backend.client, "notifyEffect", (method, params) => Effect.sync(() => enteredCancel()).pipe(
+    Effect.andThen(Deferred.await(write)), Effect.andThen(notify(method, params))));
+  const stop = new AbortController();
+  const send = backend.prompt(record, "question", stop.signal, () => {});
+  await permissionOpened;
+  let settled = false;
+  const queued = backend.requestPermission("session/request_permission", { sessionId: record.id,
+    toolCall: { toolCallId: "queued", title: "Queued" }, options: [{ optionId: "yes", name: "Allow", kind: "allow_once" }] }).then((result) => {
+      settled = true;
+      return result;
+    });
+  stop.abort();
+  await cancelStarted;
+  let lateSettled = false;
+  const late = backend.requestPermission("session/request_permission", { sessionId: record.id,
+    toolCall: { toolCallId: "late", title: "Late" }, options: [{ optionId: "yes", name: "Allow", kind: "allow_once" }] }).then((result) => {
+      lateSettled = true;
+      return result;
+    });
+  await new Promise(setImmediate);
+  assert.equal(settled, false);
+  assert.equal(lateSettled, false);
+  assert.equal(pickers, 1, "Queued and late cancelled permissions never open UI");
+  Deferred.doneUnsafe(write, Effect.void);
+  assert.deepEqual(await queued, { outcome: { outcome: "cancelled" } });
+  assert.deepEqual(await late, { outcome: { outcome: "cancelled" } });
+  assert.equal((await send).stopReason, "cancelled");
+});
+
 test("template preparation Stop before submission never sends cancel or history", async (t) => {
   const backend = sessions(t);
   const record = await backend.create(__dirname);
@@ -460,6 +705,50 @@ test("config Stop while waiting returns cancelled without cancel RPC or claiming
   await backend.client.requestExtension("echo", { control: "release-config" });
   await change;
   assert.equal(record.configOptions[1].currentValue, "custom-agent");
+});
+
+test("config update and setter response commit complete snapshots in either order", { timeout: 3000 }, async (t) => {
+  const backend = sessions(t, undefined, "config-delayed");
+  const record = await backend.create(__dirname);
+  const events = [];
+  let observedRevision = record.configRevision;
+  backend.on("config", () => {
+    if (record.configRevision !== observedRevision) {
+      observedRevision = record.configRevision;
+      events.push(structuredClone(record.configOptions));
+    }
+  });
+
+  const beforeResponse = structuredClone(record.configOptions);
+  beforeResponse[1].currentValue = "workspace-agent";
+  const responseAfterUpdate = structuredClone(record.configOptions);
+  responseAfterUpdate[0].currentValue = `provider/${path.basename(__dirname)}/plain`;
+  const firstRevision = record.configRevision;
+  const firstPending = configBarrier(t, backend.client);
+  const firstChange = backend.setConfigOption(record, "mode", "custom-agent", firstRevision);
+  await firstPending;
+  await backend.client.requestExtension("echo", { control: "update-config", sessionId: record.id, configOptions: beforeResponse });
+  await backend.client.requestExtension("echo", { control: "next-config-response", result: { configOptions: responseAfterUpdate } });
+  await backend.client.requestExtension("echo", { control: "release-config" });
+  await firstChange;
+  assert.deepEqual(record.configOptions, responseAfterUpdate);
+  assert.equal(record.configRevision, firstRevision + 2);
+
+  const afterResponse = structuredClone(record.configOptions);
+  afterResponse[1].currentValue = "custom-agent";
+  const afterUpdate = structuredClone(record.configOptions);
+  afterUpdate[0].currentValue = `provider/${path.basename(__dirname)}/initial`;
+  const secondRevision = record.configRevision;
+  const secondPending = configBarrier(t, backend.client);
+  const secondChange = backend.setConfigOption(record, "mode", "workspace-agent", secondRevision);
+  await secondPending;
+  await backend.client.requestExtension("echo", { control: "next-config-response", result: { configOptions: afterResponse } });
+  await backend.client.requestExtension("echo", { control: "release-config" });
+  await secondChange;
+  await backend.client.requestExtension("echo", { control: "update-config", sessionId: record.id, configOptions: afterUpdate });
+  assert.deepEqual(record.configOptions, afterUpdate);
+  assert.equal(record.configRevision, secondRevision + 2);
+  assert.equal(events.length, 4);
 });
 
 test("config reconnect replaces selections, rejects pre-load revision and ignores old connection notifications", async (t) => {

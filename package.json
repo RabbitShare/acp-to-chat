@@ -7,7 +7,8 @@
   "repository": "https://github.com/RabbitShare/acp-to-chat",
   "private": true,
   "engines": {
-    "vscode": "^1.140.0"
+    "vscode": "^1.140.0",
+    "node": ">=22.19.0"
   },
   "main": "./dist/main.js",
   "extensionKind": [
@@ -35,6 +36,8 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "visualize": "effect-machine --root src --include \"machines/**/*.ts\"",
+    "visualize:build": "effect-machine build --root src --include \"machines/**/*.ts\" --out-dir .effect-machine/site",
     "check-types": "tsc --noEmit",
     "pretest": "npm run build",
     "precheck": "npm run build && npm run check-types",
@@ -116,12 +119,15 @@
     }
   },
   "devDependencies": {
+    "@typeonce/effect-machine-devtools": "0.40.0",
     "@types/node": "24.10.1",
     "esbuild": "0.28.2",
-    "typescript": "5.9.3"
+    "typescript": "7.0.2"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.7.0",
+    "@typeonce/effect-machine": "0.40.0",
+    "effect": "4.0.2",
     "jsonc-parser": "3.3.1",
     "yaml": "2.9.1",
     "zod": "3.25.76"

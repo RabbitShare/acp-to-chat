@@ -21,6 +21,7 @@ const configurations = new Map();
 const traffic = [];
 const templateHistory = new Map();
 let heldConfig;
+let heldLoad;
 let nextConfigResponse;
 let replayPermission;
 function catalog(cwd) {
@@ -107,6 +108,12 @@ lines.on("line", (line) => {
       send({ id: message.id, result: {} });
       return;
     }
+    if (message.params.control === "release-load") {
+      heldLoad?.();
+      heldLoad = undefined;
+      send({ id: message.id, result: {} });
+      return;
+    }
     const reply = { id: message.id, result: { text: "Hello 🌍", params: message.params } };
     if (message.params.n === 1) firstEcho = reply;
     else if (message.params.n === 2) {
@@ -156,6 +163,12 @@ lines.on("line", (line) => {
     if (scenario === "commands-after-new") commandUpdate(sessionId, commandCatalog(message.params.cwd));
     if (scenario === "crash-idle") setTimeout(() => process.exit(7), 100);
   } else if (message.method === "session/load") {
+    if (scenario === "load-delayed-error") {
+      heldLoad = () => send({ id: message.id, error: { code: -32000, message: "joined load failed" } });
+      send({ method: "session/update", params: { sessionId: message.params.sessionId,
+        update: { sessionUpdate: "session_info_update", title: "Load pending" }, _meta: { fixture: "load_pending" } } });
+      return;
+    }
     workingDirectories.set(message.params.sessionId, message.params.cwd);
     const options = configurations.get(message.params.sessionId) ?? catalog(message.params.cwd);
     configurations.set(message.params.sessionId, options);
@@ -227,7 +240,7 @@ lines.on("line", (line) => {
       return;
     }
     const permissionId = `permission-${message.id}`;
-    pending.set(sessionId, { id: message.id, cancelled: false });
+    pending.set(sessionId, { id: message.id, cancelled: false, remainingPermissions: scenario === "concurrent-permissions" ? 2 : 1, permissionResults: [] });
     permissions.set(permissionId, sessionId);
     if (scenario === "malformed-updates") {
       for (const update of [
@@ -245,6 +258,12 @@ lines.on("line", (line) => {
     if (scenario === "malformed-permission-title") permission.toolCall.title = 42;
     if (scenario === "malformed-permission-kind") permission.options[0].kind = "not-an-ACP-permission-kind";
     send({ id: permissionId, method: "session/request_permission", params: permission });
+    if (scenario === "concurrent-permissions") {
+      const secondId = `${permissionId}-second`;
+      permissions.set(secondId, sessionId);
+      send({ id: secondId, method: "session/request_permission", params: { ...permission,
+        toolCall: { ...permission.toolCall, toolCallId: `second-${sessionId}`, title: "Independent tool" } } });
+    }
     if (scenario === "crash-prompt") setTimeout(() => process.exit(8), 100);
   } else if (message.method === "session/cancel") {
     const turn = pending.get(message.params.sessionId);
@@ -254,8 +273,14 @@ lines.on("line", (line) => {
     const turn = pending.get(sessionId);
     if (scenario === "ignore-cancel" && turn?.cancelled) return;
     send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: `tool-${sessionId}`, title: "Run command", status: "completed", rawOutput: message.result } } });
-    if (turn) send({ id: turn.id, result: { stopReason: turn.cancelled ? "cancelled" : "end_turn", _meta: { permission: message.result, cwd: workingDirectories.get(sessionId) } } });
-    pending.delete(sessionId);
+    if (turn) {
+      turn.permissionResults.push(message.result);
+      if (--turn.remainingPermissions === 0) {
+        send({ id: turn.id, result: { stopReason: turn.cancelled ? "cancelled" : "end_turn", _meta: { permission: message.result,
+          ...(scenario === "concurrent-permissions" ? { permissions: turn.permissionResults } : {}), cwd: workingDirectories.get(sessionId) } } });
+        pending.delete(sessionId);
+      }
+    }
     permissions.delete(message.id);
   }
 });

@@ -21,7 +21,7 @@ OpenCode manages models, agents, skills, MCP servers, permissions, and conversat
 
 - **VS Code 1.140.0** is the compatibility baseline. Other versions, including Insiders, may need API changes.
 - **OpenCode V2** with `opencode acp` and provider authentication already configured.
-- **Node.js and npm** to build the extension from source.
+- **Node.js 22.19 or newer and npm** to build the extension from source and run the machine devtools.
 - An open, trusted local workspace with native VS Code Chat enabled.
 
 A Copilot subscription is not required by the extension. VS Code's native Chat infrastructure must still be available.
@@ -159,6 +159,8 @@ See [transport policy and resource limits](docs/development.md#transport-and-lim
 
 ## Development
 
+Asynchronous orchestration uses **Effect 4.0.2** and executable **Effect Machine 0.40.0** statecharts for the shared connection, session load/configuration, and each turn. TypeScript **7.0.2** checks the source; esbuild bundles runtime ESM dependencies into CommonJS for the extension host. The native Chat/ACP contract and SDK-owned protocol handling are unchanged. See [runtime ownership and compatibility boundaries](docs/development.md#effect-runtime-and-machine-ownership).
+
 ### Checks
 
 ```bash
@@ -169,6 +171,28 @@ npm run check
 These commands build the extension, run fixture-based unit tests, and check strict TypeScript, syntax, and editor configuration files. Tests do not require a model, API keys, or an installed OpenCode. The VS Code API is replaced by a test double; native UI checks are separate.
 
 After changing source files, rebuild and run **Developer: Reload Window** in the development host.
+
+### Machine visualizer
+
+Run the official Effect Machine devtools from the extension directory:
+
+```bash
+npm run visualize
+```
+
+Open `http://127.0.0.1:5173`. The source watcher is restricted to `src/machines/` and discovers the exported `ConnectionMachine`, `SessionMachine`, and `TurnMachine` definitions; this is not a connection to the running extension.
+
+For a static website:
+
+```bash
+npm run visualize:build
+```
+
+Serve the generated `.effect-machine/site` directory using a local static host bound to loopback. Generated files are ignored by Git; rebuild when machine definitions change.
+
+The graph and simulation explore **topology only**. Simulation offers explicit transition/outcome choices and a timeline; it does not run Effects, guards, resolvers, invocations, or ACP requests. It does not observe live sessions or prove runtime/native behavior.
+
+**Trusted source only:** discovery evaluates imported project modules. These machine definitions perform no IO or runtime `vscode` import on import, but arbitrary module initialization can execute. Keep the unauthenticated devtools and static host on loopback; do not expose them to untrusted networks. See [visualizer limits and checks](docs/development.md#machine-visualizer-and-topology-simulation).
 
 ### Contract sources
 

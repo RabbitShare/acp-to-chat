@@ -11,11 +11,12 @@ Historical results below apply to the builds and scenarios explicitly named. The
 - An open, trusted local folder. For a multi-root workspace, the extension asks you to choose a working directory.
 - Native VS Code Chat must be enabled. The extension does not require a Copilot subscription, but it does not replace the editor's chat infrastructure.
 
-Development requires Node.js and npm: `npm ci` installs the TypeScript/esbuild tools and runtime dependencies pinned in the lockfile.
-The `src/*.ts` source files are checked in strict mode and built into CommonJS bundles in `dist/`.
-The thin `src/main.ts` entry point loads the VS Code API; the editor runs `dist/main.js`, and unit tests run the other three bundles.
-Runtime dependencies are pinned exactly: `@agentclientprotocol/sdk@1.7.0`, `zod@3.25.76`, `yaml@2.9.1`, and `jsonc-parser@3.3.1`.
-`zod` is a direct dependency for the SDK peer requirement (`^3.25.0 || ^4.0.0`). esbuild includes the ESM SDK and `zod` in CommonJS bundles; they do not remain external.
+Development requires **Node.js 22.19 or newer** and npm: `npm ci` installs the tools and runtime dependencies pinned in the lockfile.
+TypeScript **7.0.2** checks `src/**/*.ts` in strict mode; esbuild builds CommonJS bundles in `dist/`.
+The thin `src/main.ts` entry point loads the VS Code API; the editor runs `dist/main.js`. Unit tests import the adapter, sessions, transport, and additional `dist/machines/*.js` entrypoints.
+Runtime dependencies are pinned exactly: `effect@4.0.2`, `@typeonce/effect-machine@0.40.0`, `@agentclientprotocol/sdk@1.7.0`, `zod@3.25.76`, `yaml@2.9.1`, and `jsonc-parser@3.3.1`.
+`zod` is a direct dependency for the SDK peer requirement (`^3.25.0 || ^4.0.0`). esbuild includes the ESM SDK, Effect, Effect Machine, and `zod` in CommonJS bundles; `vscode` and Node built-ins remain external.
+The matching `@typeonce/effect-machine-devtools@0.40.0` is development-only. Its transitive TypeScript **6.0.3** and `@effect/platform-*` packages support discovery/server/browser tooling, not the project compiler or extension runtime. Runtime source does not import devtools.
 A separate extension server is not needed: the extension launches `opencode acp` over stdio.
 
 ## Running without installing a VSIX
@@ -98,7 +99,7 @@ These observations predate the TypeScript/build migration and do not automatical
 The participant is registered with ID `opencode`, matching the session type, and routes native Send to the same ACP handler as the content provider.
 `opencode acp` launches a private server rather than connecting to a shared background service.
 
-Attachments, importing all existing sessions, deletion, fork, and integrating file changes with VS Code Undo are not yet implemented.
+Binary and other unsupported attachments, importing all existing sessions, deletion, fork, and integrating file changes with VS Code Undo are not yet implemented. Supported text file context is described below.
 OpenCode itself makes file changes. The extension displays the tool but does not apply its changes a second time.
 The extension does not provide ACP filesystem/terminal capabilities and is not a sandbox for OpenCode.
 OpenCode permission settings still apply: a request appears only if OpenCode asks for permission.
@@ -186,11 +187,48 @@ The next user screenshot shows the selected native `/aw-just-answer` suggestion 
 ## Transport and limits
 
 Stable SDK `client()` / `ndJsonStream()` handles NDJSON parsing/serialization, JSON-RPC IDs, and correlation over stdio.
-The adapter manages the child process, deadlines, fail-closed behavior, and resource cleanup; `Sessions` manages application state and permission/cancel policy.
+The adapter manages the child process, deadlines, fail-closed behavior, and physical cleanup. ConnectionMachine owns logical connection lifecycle; SessionMachine and TurnMachine own session operations and permission/cancel policy through their services. `Sessions` supplies synchronous admission, the registry, and current projections.
 Invalid JSON/envelopes, limit violations, write errors, and unexpected EOF close the shared connection and settle pending requests.
 Ordinary ACP requests have a 30-second deadline; `session/prompt` has no overall deadline. A timeout closes the connection and process, affecting its other sessions.
 Each incoming message is limited to 16 MiB of **bytes**; the previous JS buffer-length limit in UTF-16 is not equivalent to this bound.
 After stdout EOF, the adapter waits no more than 100 ms for process termination to obtain the exit code/signal; if the process is still alive, it reports unexpected EOF and starts cleanup. Later exit context in the original error is not guaranteed.
+
+## Effect runtime and machine ownership
+
+The migration keeps native Chat and ACP behavior, rather than introducing another chat or transport. The concrete exported `.handle(...)` definitions in `src/machines/` are executable owners with lazy service-backed Effects:
+
+- `ConnectionMachine` (`connection.ts`) owns `Idle`, startup, initialization, `Ready`, failure, closing, and terminal `Closed` for one connection generation. The generation scope owns the acquired `AcpClient`; the adapter retains its idempotent fatal latch and physical SDK/process shutdown. A failed connection can be replaced by a new generation, never by restarting `Closed`.
+- `SessionMachine` (`session.ts`) has parallel Load and Config regions. `SessionOwner` owns session single-flight load, confirmed config/revision commits, catalogs, and history through the current `SessionRecord` projection. All callers joining a load receive the same success or failure. Setter failure or malformed confirmation makes config uncertain; a later fresh load recovers without replaying the setter or old permissions/tools.
+- `TurnMachine` (`turn.ts`) orders accepted-config wait, load, template expansion, and file context preparation. `Active` owns prompt and permission invocations; `Running` and `Cancelling` are children. Stop moves between those children without interrupting the SDK-awaiting prompt. A handled asynchronous `session/cancel` is sent once after submission; a five-second hung cancel closes the shared connection. Before submission, Stop sends no cancel and adds no history. Stop of a waiting turn does not cancel the session-owned setter or load.
+
+`src/sessions.ts` keeps same-stack admission synchronous: setter/turn reservations and lock projections are visible before dispatch. Correlated `Deferred` completions exist before machine events are sent; mailbox delivery, `send`, or a state observation is not operation acknowledgement. The compatible record is the current authoritative projection, not a lagging subscriber. Config data and revision commit together before events/completion. Generation and operation identity checks keep old callbacks/cleanup from mutating current work. Final reference/history/command checks, user-history append, and SDK prompt creation have no asynchronous boundary between them.
+
+The native adapter uses an explicit application `Scope` and a `NativeRunner` based on `Effect.forkIn`/`Fiber.join`/`Effect.runPromise`, **not `ManagedRuntime`**. `Sessions` separately owns the backend application scope and connection-generation scopes. Turns and permission resources have scoped lifetimes; template reads acquire/release file handles, and permission Quick Picks acquire/release their picker and listeners. Metadata writes are serialized and store only `id/cwd/label/created`. Disposing a UI input binding removes that binding, not its backend session. Terminal disposal rejects new work/reconnects and starts scoped cleanup; backend `disposeEffect()` joins cleanup. Physical child termination still ends stdin and escalates to SIGTERM after two seconds and SIGKILL after three seconds if the child remains alive.
+
+Effect-returning operations drive native workflows and preparation. Existing Promise facades (`connect/create/load/prompt`, transport request/notify, template/file helpers, and native callbacks) remain compatibility boundaries for VS Code, SDK/Web Streams, Node IO, and existing callers/tests. Promise-valued lock projections expose correlated completion; they are not a second orchestration owner. The native selection callback checks revision/membership synchronously and reserves the backend setter before invoking the native runner, so a same-stack Send observes it. The session operation rechecks revision/membership after load. Preserve this ordering when changing the boundary.
+
+No machine snapshot is persisted or resumed. OpenCode remains the history authority; ACP load is the recovery path. Ordinary RPC deadlines remain 30 seconds, prompts have no overall deadline, and shared failure still affects every session on that process.
+
+Implementation and regression-test progress is recorded in [the Effect migration contract](plans/effect-migration.md). Aggregate verification and independent reviews remain pending; no native editor verification or release approval is implied by this migration or the visualizer.
+
+## Machine visualizer and topology simulation
+
+Use the official matching devtools, not a handwritten graph generator:
+
+```bash
+npm run visualize
+npm run visualize:build
+```
+
+The first command watches only `src/machines/**/*.ts` and serves `http://127.0.0.1:5173`; it does not watch editor profiles, test sockets, or other repository files. The second evaluates the same exports once and writes `.effect-machine/site/index.html`, `machines.json`, `manifest.json`, and browser assets. Serve that directory with a static host bound to loopback; it needs neither project source nor Node/devtools after generation. `.effect-machine/` is ignored by Git. Rebuild the site after changing a machine.
+
+Expected exports are `ConnectionMachine`, `SessionMachine`, and `TurnMachine`, each with a Ready document and no diagnostics. Discovery consumes the concrete implemented `.handle(...)` definitions, not separately maintained diagrams. Importing their modules does not import runtime `vscode`, launch ACP, or perform file/network IO: dependencies and IO are resolved lazily through services or owner construction/execution.
+
+**Evaluation is not a sandbox.** Devtools first parses candidates, then imports trusted project modules in a worker; module initialization runs. The machine modules here are import-safe, but a future top-level side effect or arbitrary untrusted import would execute. Keep the unauthenticated server on `127.0.0.1` (default) or another loopback address. Do not bind to a public interface or run discovery against untrusted code.
+
+The browser graph exposes state/event schemas, compound and parallel regions, transitions, and invocations. Its simulation chooses edges/branches/invoke outcomes explicitly and records an immutable timeline; selecting an earlier step permits a different path. This is **document-only topology simulation**: no Effects, guards, resolvers, state updates, runtime events, invocations, or commands run. Unresolved runtime targets remain unavailable. The source watcher refreshes documents, not runtime snapshots; there is no live extension connection, ACP inspection, session recovery, or persistence.
+
+When changing machine definitions, run `npm run visualize:build` and inspect `machines.json` for all three Ready exports without diagnostics. Exercise simulation and timeline separately from runtime tests where browser tooling is available. Neither a successful site build nor a walkthrough proves synchronous admission, cancellation, permission safety, deadlines, or native Send; those require fixture/runtime regressions and separately observed editor checks.
 
 ## Checks
 
@@ -199,12 +237,15 @@ npm ci
 npm run check-types
 npm test
 npm run check
+npm run visualize:build
+git diff --check
 ```
 
 `npm test` first builds bundles through `pretest`; `npm run check` first builds and type-checks through `precheck`.
 Check verifies the syntax of bundles and remaining JS/CJS tests, the manifest, and launch/tasks JSON, but not editor compatibility.
 Tests use the Node.js built-in runner and a real child ACP fixture process, without an LLM, API keys, or a separate test framework.
 The VS Code boundary double in unit tests does not prove compatibility with the real editor.
+The static visualizer check verifies machine discovery/projection, not execution or native compatibility. Check dependency peers and confirm devtools are excluded from runtime bundles after changing dependencies/build boundaries.
 
 Before running a single file directly, update the bundles:
 
@@ -306,6 +347,6 @@ Stage map: [plans](plans/README.md), [Model/Agent/Reasoning: status and original
 - [SDK 1.7.0: package and peer dependency](https://github.com/agentclientprotocol/typescript-sdk/blob/v1.7.0/package.json)
 - [SDK 1.7.0: stable client](https://github.com/agentclientprotocol/typescript-sdk/blob/v1.7.0/src/acp.ts) and [NDJSON stream](https://github.com/agentclientprotocol/typescript-sdk/blob/v1.7.0/src/stream.ts)
 
-The SDK is distributed under Apache-2.0, `zod` and `jsonc-parser` under MIT, and `yaml` under ISC. Before distributing bundles/VSIX, include the corresponding license texts and attribution notices from the installed packages; bundling does not remove these requirements. Packaging and distribution were not verified in this migration.
+The SDK is distributed under Apache-2.0, Effect, Effect Machine, `zod`, and `jsonc-parser` under MIT, and `yaml` under ISC. Before distributing bundles/VSIX, include the corresponding license texts and attribution notices from the installed packages; bundling does not remove these requirements. Packaging and distribution were not verified in this migration.
 
 Do not publish the extension to Marketplace with proposed APIs. A local run does not install the extension globally or change user settings.

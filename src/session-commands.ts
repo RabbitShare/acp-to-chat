@@ -2,6 +2,8 @@ import type * as VSCode from "vscode";
 import type { EditorApi } from "./extension";
 import type { SessionRecord, Sessions } from "./sessions";
 import { fileReference } from "./session-files";
+import { Effect } from "effect";
+import type { NativeRunner } from "./extension";
 
 const SCHEME = "opencode-command";
 // Global commands accepted ahead of prompt customizations by the 1.140.0
@@ -9,7 +11,7 @@ const SCHEME = "opencode-command";
 const NATIVE_COMMANDS = new Set(["clear", "models", "debug", "fork", "vscode-pet"]);
 
 export function registerSessionCommands(vscode: EditorApi, backend: Sessions,
-  resolve: (resource: VSCode.Uri) => Promise<SessionRecord | undefined>) {
+  resolve: (resource: VSCode.Uri) => Promise<SessionRecord | undefined> | Effect.Effect<SessionRecord | undefined, unknown>, run: NativeRunner = Effect.runPromise) {
   const changed = new vscode.EventEmitter<void>();
   const fileChanges = new vscode.EventEmitter<VSCode.FileChangeEvent[]>();
   const files = new Map<string, { record: SessionRecord; snapshot: SessionRecord["availableCommands"]; content: Uint8Array }>();
@@ -41,11 +43,10 @@ export function registerSessionCommands(vscode: EditorApi, backend: Sessions,
     writeFile: denied, delete: denied, rename: denied, createDirectory: denied,
   };
 
-  const provider: VSCode.ChatSessionCustomizationProvider = {
-    onDidChange: changed.event,
-    async provideChatSessionCustomizations(resource, token) {
+  const provide = Effect.fnUntraced(function* (resource: VSCode.Uri, token: VSCode.CancellationToken) {
       if (disposed || token.isCancellationRequested || resource.scheme !== "opencode") return [];
-      const record = await resolve(resource);
+      const resolution = resolve(resource);
+      const record = yield* Effect.isEffect(resolution) ? resolution : Effect.tryPromise({ try: () => resolution, catch: (error) => error });
       if (!record || disposed || token.isCancellationRequested || record.connection !== backend.client || backend.client?.failure) return [];
       const previous = published.get(record);
       if (previous) return previous;
@@ -72,7 +73,10 @@ export function registerSessionCommands(vscode: EditorApi, backend: Sessions,
       }
       published.set(record, items);
       return items;
-    },
+  }, Effect.catchDefect((error) => Effect.fail(error)));
+  const provider: VSCode.ChatSessionCustomizationProvider = {
+    onDidChange: changed.event,
+    provideChatSessionCustomizations: (resource, token) => disposed ? Promise.resolve([]) : run(provide(resource, token)),
   };
   const listener = (record: SessionRecord) => { forget(record); changed.fire(); };
   const registrations = [

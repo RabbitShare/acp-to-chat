@@ -6,6 +6,7 @@ test/**
 src/**
 tsconfig.json
 AGENTS.md
+CONTRIBUTING.md
 docs/**
 scripts/**
 types/**

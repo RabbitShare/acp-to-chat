@@ -22,6 +22,8 @@ The original stage plans remain historical. After they were saved, the TypeScrip
 3. [03-native-resend-and-verification.md](03-native-resend-and-verification.md) — an independent track for editing/Retry, fork, and native validation: the ACP 2.0.21 limitation, UX agreement, missing-response diagnosis, remaining native UI checks, cleanup, and final verification.
 4. [04-model-and-reasoning.md](04-model-and-reasoning.md) — Model/Agent/Reasoning through ACP: status of the implemented backend/native adapter, agreed clarifications, and the historical original plan. Native evidence is still required.
 5. [effect-migration.md](effect-migration.md) — approved Effect/statechart implementation contract and execution ledger, including official devtools, preserved operation/security contracts, and completed automated verification.
+6. [binary-attachments.md](binary-attachments.md) — approved ACP-native attachment plan: text/image/audio/blob classification, negotiated capabilities, 4 MiB per binary attachment and 8 MiB combined limits, and existing behavior regressions. Audio requires explicit agent support; implementation and native verification remain pending.
+7. [deferred-response-activity.md](deferred-response-activity.md) — approved presentation contract: keep incremental text streaming and defer reasoning/tool UI until successful prompt completion; discard pending live activity on Stop/error and use text-first history projection. Plan recorded; implementation and native verification remain pending.
 
 **Dependency rule:** plans 01 and 02 may be executed on a separate request without completing plan 03; plan 02 depends only on plan 01. Plan 03 does not block the migrations and is not their mandatory first stage.
 

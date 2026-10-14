@@ -1,94 +1,92 @@
-# ACP to Chat
+# OpenCode Native Chat
 
-Use **OpenCode in VS Code's native Chat** through the Agent Client Protocol (ACP).
+**Your OpenCode setup. Your models. Right inside VS Code Chat.**
 
-The extension, **OpenCode Native Chat**, connects the editor to your local `opencode acp` process. It uses your existing OpenCode configuration and credentials, with no webview, separate chat interface, or patched editor.
+![OpenCode Native Chat — your models, agents, and tools in VS Code's native Chat](images/opencode-native-chat.png)
 
-> **Experimental.** This project uses proposed VS Code APIs and runs as a development extension. It is not a Marketplace release or a general-purpose provider for arbitrary ACP agents.
+Ask about your code, follow tool activity, and keep the conversation next to your editor. **OpenCode Native Chat** brings your local OpenCode agent into VS Code's native Chat through the Agent Client Protocol (ACP)—without a webview or a separate chat interface.
 
-## Features
+Keep the OpenCode configuration you already use: providers, credentials, agents, skills, MCP servers, and permissions. No second provider setup in the extension. No Copilot subscription required.
 
-- Create OpenCode sessions and reopen their saved conversations.
-- Stream responses, reasoning, and tool activity in native Chat.
-- Choose Model, Agent, and available Reasoning options from the session's OpenCode catalog.
-- Discover session-specific slash commands with native `/` suggestions.
-- Approve or reject tool permissions through VS Code Quick Pick.
-- Stop an active response and continue the conversation.
+## Why OpenCode Native Chat?
 
-OpenCode manages models, agents, skills, MCP servers, permissions, and conversation history. The extension supplies the native editor interface.
+- **Stay in your editor.** Stream answers, reasoning, and tool activity directly in native Chat.
+- **Choose how you work.** Pick Model, Agent, and available Reasoning options from your session's OpenCode catalog.
+- **Bring the right context.** Attach text files and selections, including unsaved changes, without copying them into your message.
+- **Find your commands.** Discover session-specific slash commands through native `/` suggestions.
+- **Stay in control.** Approve or reject requested tool permissions with Quick Pick. Stop a response and continue the conversation.
+- **Pick up where you left off.** Reopen conversations created by the extension in the same workspace.
 
-## Requirements
+## Open your first chat
 
-- **VS Code 1.140.0** is the compatibility baseline. Other versions, including Insiders, may need API changes.
-- **OpenCode V2** with `opencode acp` and provider authentication already configured.
-- **Node.js 22.19 or newer and npm** to build the extension from source and run the machine devtools.
-- An open, trusted local workspace with native VS Code Chat enabled.
+Once the extension is installed and proposed APIs are enabled:
 
-A Copilot subscription is not required by the extension. VS Code's native Chat infrastructure must still be available.
+1. Open a local project folder in VS Code and grant Workspace Trust only if you trust it.
+2. Open the Command Palette: **Cmd+Shift+P** on macOS or **Ctrl+Shift+P** on Windows/Linux.
+3. Run **OpenCode: New Native Chat Session**.
+4. Choose a working directory when prompted. Your empty session opens in the Chat sidebar.
+5. Choose the available session options, type your message, and press **Send**.
 
-## Quick start
+Try: **“Explain how this project is organized and where I should start.”**
 
-### 1. Build the extension
+Creating a session does not generate a response. OpenCode starts answering only on Send. The top **+** in OpenCode Chat uses the same New Session action.
 
-```bash
-git clone https://github.com/RabbitShare/acp-to-chat.git
-cd acp-to-chat
-npm ci
-npm run build
-```
+## Installation and requirements
 
-### 2. Launch a development window
+> **Experimental preview.** This build uses proposed VS Code APIs. It can be shared as a VSIX or run from source, but it is **not currently eligible for Marketplace publication** under Microsoft's [proposed API policy](https://code.visualstudio.com/api/advanced-topics/using-proposed-api#sharing-extensions-using-the-proposed-api).
 
-Run this from the extension directory. Replace the final path with the project you want OpenCode to work on:
+You need:
 
-```bash
-EXTENSION_DIR="$(pwd)"
-code --new-window \
-  --user-data-dir="$EXTENSION_DIR/test/.editor-profile" \
-  --extensions-dir="$EXTENSION_DIR/test/.editor-extensions" \
-  --extensionDevelopmentPath="$EXTENSION_DIR" \
-  --enable-proposed-api=RabbitShare.opencode-native-chat \
-  /absolute/path/to/your/project
-```
+- **VS Code 1.140.0**, the compatibility baseline. Other versions, including Insiders, may need API changes.
+- **OpenCode V2** installed, with `opencode acp` available and provider authentication configured.
+- An open, trusted **local workspace** with native VS Code Chat enabled.
 
-Use `code-insiders` instead of `code` if your editor does not permit the proposed APIs. Compatibility still depends on its API version.
-
-Alternatively, open the extension directory in VS Code and press **F5** with the **OpenCode Native Chat** launch configuration. It builds the extension automatically. Open your target project in the resulting Extension Development Host window.
-
-### 3. Start a conversation
-
-1. Grant Workspace Trust only if you trust the project.
-2. Run **OpenCode: New Native Chat Session** from the Command Palette.
-3. Choose a working directory when prompted. The extension opens an empty session in the Chat sidebar.
-4. Select the available session options, enter a message, and press **Send**.
-
-Creating a session does not generate a response; generation starts on Send. The top **+** in OpenCode Chat uses the same New Session action.
-
-## Installing a shared VSIX
-
-This extension uses proposed APIs. Installing a VSIX does not enable them, and the extension cannot grant itself access. Microsoft's [proposed API guide](https://code.visualstudio.com/api/advanced-topics/using-proposed-api) supports sharing VSIX packages, not publishing proposed-API extensions to the Marketplace. It recommends Insiders; this project still targets the VS Code 1.140.0 API contract.
-
-1. Install the package through **Extensions: Install from VSIX...**.
-2. Run **Preferences: Configure Runtime Arguments** from the Command Palette.
-3. Add the following property to the existing `argv.json` object. Preserve other properties and any existing extension IDs in the array:
-
-   ```json
-   "enable-proposed-api": ["RabbitShare.opencode-native-chat"]
-   ```
-
-4. Fully quit VS Code and reopen it. Reload Window alone does not apply startup arguments.
-
-Alternatively, fully quit the editor and launch it for that run with:
+To install a shared `.vsix` package, run **Extensions: Install from VSIX...** from the Command Palette. Then fully quit VS Code and launch your project with proposed APIs enabled:
 
 ```bash
 code --enable-proposed-api=RabbitShare.opencode-native-chat /absolute/path/to/your/project
 ```
 
-Use `code-insiders` for Insiders. Enabling proposed APIs does not make an incompatible editor version compatible.
+Use `code-insiders` for Insiders; the editor must still have compatible APIs.
 
-## Configuration
+Alternatively, enable proposed APIs for every launch through **Preferences: Configure Runtime Arguments**:
 
-If VS Code cannot find OpenCode, set its executable path:
+1. Open the Command Palette and run **Preferences: Configure Runtime Arguments**.
+2. Add this property to the existing `argv.json` object. Preserve other properties and any existing extension IDs in the array:
+
+   ```json
+   "enable-proposed-api": [
+     "RabbitShare.opencode-native-chat"
+   ]
+   ```
+
+3. Fully quit VS Code and reopen it. **Developer: Reload Window** alone does not apply startup arguments.
+
+Building from source? Follow [CONTRIBUTING.md](CONTRIBUTING.md#build-and-run).
+
+## Use your OpenCode setup
+
+### Models, agents, and reasoning
+
+Use the inline **Model**, **Agent**, and **Reasoning** selectors to choose backend-confirmed options for the current session. Reasoning appears only when OpenCode offers effort choices. Selectors lock while a response or configuration change is pending.
+
+The standard VS Code model entry **OpenCode (configured)** is a compatibility bridge—not your actual OpenCode model selection. Generic empty drafts use backend defaults until their first Send; use **OpenCode: New Native Chat Session** for selectors before sending.
+
+### Files and selections
+
+Attach a text file or selection using native Chat. Context included by the editor, such as the active file or viewport, is also sent to OpenCode. Current document text is used, including unsaved edits; selections and viewports send only their ranges. Opening another file does not automatically attach it.
+
+Each Send supports up to **32 file references** and **1 MiB of combined UTF-8 text**. Unsupported or unreadable context fails explicitly before sending. The backend must advertise ACP `embeddedContext`. Accepting a remote document reference does not mean remote workspaces are supported.
+
+### Slash commands
+
+Type `/` in a created or reopened session to discover commands advertised by OpenCode. Currently, the extension expands supported local Markdown, JSON, and JSONC text templates before sending. Plugin, MCP, and other dynamic commands without a supported local template are rejected.
+
+This is not full OpenCode command execution: built-in `/compact` without a local text template is unavailable, and a same-named template does not perform real compaction. See [template support and restrictions](docs/development.md#local-template-expansion).
+
+## Settings
+
+If VS Code cannot find OpenCode, set its executable path in **user settings**:
 
 ```json
 {
@@ -96,112 +94,36 @@ If VS Code cannot find OpenCode, set its executable path:
 }
 ```
 
-This setting accepts an executable path, not a shell command or arguments. The extension adds `acp` itself. Configure provider authentication in OpenCode before using the extension.
+Use an executable path, not a shell command or arguments. The extension adds `acp` itself.
 
-Set `opencodeNativeChat.env` in **user settings** to pass environment variables to the OpenCode child process. These machine-specific settings are not synchronized or configurable by a workspace. Values must be literal strings; shell expressions and variable substitutions are not evaluated. Overrides are merged over VS Code's inherited environment without changing the extension host's environment. Local slash templates use the same launch environment snapshot to resolve OpenCode configuration sources. The default is `{}`.
+- **`opencodeNativeChat.env`**: environment overrides for the OpenCode process. Values must be literal strings; shell expressions are not evaluated. Defaults to `{}`.
+- **`opencodeNativeChat.commandTemplateDirectories`**: fallback directories for local Markdown command templates. Relative paths use the session's working directory. This does not add commands to the advertised catalog.
 
-For an explicit temporary workaround when OpenCode only works with certificate validation disabled:
+The executable and environment settings are machine-specific, not workspace-configurable or synchronized. Run **Developer: Reload Window** after changing launch settings. Variables set only in an integrated terminal do not configure the extension host. Never disable TLS certificate validation as a routine fix.
 
-```json
-{
-  "opencodeNativeChat.env": {
-    "NODE_TLS_REJECT_UNAUTHORIZED": "0"
-  }
-}
-```
+## Good to know
 
-**Warning:** This disables TLS certificate validation for OpenCode and processes that inherit its environment. HTTPS traffic, including credentials, can be intercepted. Fix the expired server/proxy certificate or incorrect system clock, then remove the override. Adding a trusted CA does not itself fix an expired certificate.
+- **OpenCode runs the tools.** Its permissions apply; the extension is not a sandbox. Approval prompts appear only when OpenCode requests them. Escape, dismissal, and cancellation never approve a tool.
+- **Send follow-up messages instead of Edit or Retry.** These operations are rejected before an ACP prompt, even if the editor still exposes an entry point. After a rejected edit, reopen the saved session; reload the window first if necessary.
+- **History stays with OpenCode.** VS Code stores only session metadata. The list shows sessions created by this extension in the current workspace, not your entire OpenCode history.
+- **Text context only.** Binary attachments, session deletion, fork, and VS Code Undo integration are not implemented.
+- **Sessions share a process.** A transport timeout or a hung cancellation can interrupt other sessions using that process.
+- **Native verification is still in progress.** Selectors, New Session, and recovery have incomplete native UI checks. Automated tests do not establish compatibility with every editor build.
 
-Run **Developer: Reload Window** after changing launch settings. Variables set only in an integrated terminal do not configure the extension host.
+## Troubleshooting
 
-### Model / Agent / Reasoning: current implementation
+**OpenCode executable not found?** Set `opencodeNativeChat.command` to an absolute executable path, then reload the window.
 
-The inline selectors use values confirmed by OpenCode for the current session. Reasoning is hidden when the backend offers no effort choices. Selectors are locked while a response or configuration change is pending.
+**`Language model unavailable` or Send is blocked?** Check the native model picker for **OpenCode (configured)** and select it if `Auto` remains. This is an editor-side bridge issue; changing OpenCode credentials will not fix it.
 
-The standard VS Code model entry **OpenCode (configured)** is a compatibility bridge, not the actual backend model selector. If VS Code reports `Language model unavailable`, check that this entry is available; changing OpenCode credentials will not fix an editor-side bridge problem.
+**Proposed API unavailable?** Check your editor version and launch arguments. Installing a VSIX alone does not enable proposed APIs. Changes to startup arguments require a full restart, not Reload Window.
 
-Generic empty drafts remain lazy and use backend defaults until the first Send. Use **OpenCode: New Native Chat Session** when you want selectors before sending a message.
+**Need diagnostics?** Open **View: Toggle Output** and choose **OpenCode Native Chat**. Review logs for secrets before sharing them.
 
-See [session configuration details and the native verification checklist](docs/development.md#model--agent--reasoning-current-implementation).
+## Feedback and contributions
 
-### Slash commands: dynamic suggestions
+[Report a bug or suggest an improvement](https://github.com/RabbitShare/acp-to-chat/issues). Include the editor and OpenCode versions, reproduction steps, and sanitized diagnostics.
 
-Type `/` in a materialized OpenCode session to see commands advertised by its ACP backend.
+For source setup, checks, architecture, and demo assets, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The extension currently expands supported local Markdown, JSON, and JSONC text templates before sending them. This works around an OpenCode ACP command-streaming issue; it is not equivalent to every OpenCode command source. Unknown commands, missing templates, and unsupported metadata are rejected rather than silently executed.
-
-Additional Markdown template directories can be configured with `opencodeNativeChat.commandTemplateDirectories`. Relative paths use the session's working directory. This is a fallback for local definitions; it does not add commands to the advertised catalog.
-
-See [supported template sources, substitutions, and restrictions](docs/development.md#local-template-expansion).
-
-### File context
-
-Attach a text file or selection using native Chat. File context included by the editor, including the active file and viewport, is sent to OpenCode as ACP embedded text resources. The extension uses current text documents, so unsaved changes are included; a selection or viewport sends only its range. Opening other files does not scan or attach them automatically.
-
-The limit is 32 file references and 1 MiB of combined UTF-8 context per Send. Local files, remote workspace documents, and already-open untitled documents are supported. Binary, unreadable, unsupported, and oversized attachments fail explicitly before the prompt is sent. The agent must advertise ACP `embeddedContext`; there is no silent fallback to dropping files. External prompt files remain unsupported as slash customizations.
-
-## Limitations and safety
-
-- Editing sent messages and native **Retry** are disabled. Send a new message instead. After a rejected edit, reopen the saved session; if necessary, run **Developer: Reload Window** first.
-- Binary attachments, importing all existing OpenCode sessions, session deletion, fork, and integration with VS Code Undo are not implemented.
-- The session list contains sessions created by this extension in the current workspace, not your entire OpenCode history.
-- Tool permission prompts appear only when OpenCode requests approval. Escape, dismissal, and cancellation never approve a tool.
-- OpenCode executes tools and changes files with its own permissions. **The extension is not a sandbox.**
-- Session selectors, the New Session action, and recovery still have incomplete native UI verification. Automated tests do not establish compatibility with every editor build.
-
-### Transport and limits
-
-The extension launches a private OpenCode process over stdio. One process can serve multiple sessions, with one active request per session. A transport timeout or forced shutdown of a hung cancellation can interrupt other sessions in that process.
-
-Only session metadata is stored in VS Code workspace state; OpenCode stores conversation history. Process diagnostics appear in the **OpenCode Native Chat** Output channel. Review logs for secrets before sharing them.
-
-See [transport policy and resource limits](docs/development.md#transport-and-limits).
-
-## Development
-
-Asynchronous orchestration uses **Effect 4.0.2** and executable **Effect Machine 0.40.0** statecharts for the shared connection, session load/configuration, and each turn. TypeScript **7.0.2** checks the source; esbuild bundles runtime ESM dependencies into CommonJS for the extension host. The native Chat/ACP contract and SDK-owned protocol handling are unchanged. See [runtime ownership and compatibility boundaries](docs/development.md#effect-runtime-and-machine-ownership).
-
-### Checks
-
-```bash
-npm test
-npm run check
-```
-
-These commands build the extension, run fixture-based unit tests, and check strict TypeScript, syntax, and editor configuration files. Tests do not require a model, API keys, or an installed OpenCode. The VS Code API is replaced by a test double; native UI checks are separate.
-
-After changing source files, rebuild and run **Developer: Reload Window** in the development host.
-
-### Machine visualizer
-
-Run the official Effect Machine devtools from the extension directory:
-
-```bash
-npm run visualize
-```
-
-Open `http://127.0.0.1:5173`. The source watcher is restricted to `src/machines/` and discovers the exported `ConnectionMachine`, `SessionMachine`, and `TurnMachine` definitions; this is not a connection to the running extension.
-
-For a static website:
-
-```bash
-npm run visualize:build
-```
-
-Serve the generated `.effect-machine/site` directory using a local static host bound to loopback. Generated files are ignored by Git; rebuild when machine definitions change.
-
-The graph and simulation explore **topology only**. Simulation offers explicit transition/outcome choices and a timeline; it does not run Effects, guards, resolvers, invocations, or ACP requests. It does not observe live sessions or prove runtime/native behavior.
-
-**Trusted source only:** discovery evaluates imported project modules. These machine definitions perform no IO or runtime `vscode` import on import, but arbitrary module initialization can execute. Keep the unauthenticated devtools and static host on loopback; do not expose them to untrusted networks. See [visualizer limits and checks](docs/development.md#machine-visualizer-and-topology-simulation).
-
-### Contract sources
-
-The integration targets public VS Code 1.140.0 proposed API declarations and ACP v1. Proposed APIs can change between editor releases.
-
-- [Development reference, contract sources, and verification history](docs/development.md)
-- [Development plans](docs/plans/README.md)
-- [VS Code 1.140.0 session API declarations](https://github.com/microsoft/vscode/blob/1.140.0/src/vscode-dts/vscode.proposed.chatSessionsProvider.d.ts)
-- [VS Code proposed API guidance](https://code.visualstudio.com/api/advanced-topics/using-proposed-api)
-- [Agent Client Protocol](https://agentclientprotocol.com/protocol/v1/overview)
-
-Do not publish this proposed-API extension to Marketplace. Packaging and distribution, including bundled dependency license notices, still require separate verification.
+Licensed under [MIT](LICENSE).
